@@ -1,0 +1,13 @@
+tax_rate,income_ll,income_hl,filing_status
+0,0,44625,single
+0,0,44625,married filing separately
+0,0,89250,married filing jointly
+0,0,59750,head of household
+0.15,44626,492300,single
+0.15,44626,276900,married filing separately
+0.15,89251,553850,married filing jointly
+0.15,59751,523050,head of household
+0.2,492301,,single
+0.2,276901,,married filing separately
+0.2,553851,,married filing jointly
+0.2,523051,,head of household

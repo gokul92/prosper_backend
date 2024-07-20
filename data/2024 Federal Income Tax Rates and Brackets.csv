@@ -1,0 +1,30 @@
+tax_rate,income_ll,income_hl,filing_status
+0.1,0,11000,single
+0.12,11001,44725,single
+0.22,44726,95375,single
+0.24,95376,182100,single
+0.32,182101,231250,single
+0.35,231251,578125,single
+0.37,578126,,single
+0.1,0,22000,married filing jointly
+0.12,22001,89450,married filing jointly
+0.22,89451,190750,married filing jointly
+0.24,190751,364200,married filing jointly
+0.32,364201,462500,married filing jointly
+0.35,462501,693750,married filing jointly
+0.37,693751,,married filing jointly
+0.10,0,11000,married filing separately
+0.12,11001,44725,married filing separately
+0.22,44726,95375,married filing separately
+0.24,95376,182100,married filing separately
+0.32,182101,231250,married filing separately
+0.35,231251,346875,married filing separately
+0.37,346876,,married filing separately
+0.1,0,15700,head of household
+0.12,15701,59850,head of household
+0.22, 59851,95350,head of household
+0.24,59851,95350,head of household
+0.24,95351,182100,head of household
+0.32,182101,231250,head of household
+0.35,231251,578100,head of household
+0.37,578101,,head of household
