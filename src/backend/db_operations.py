@@ -3,6 +3,7 @@ from psycopg.rows import dict_row
 import uuid
 import os
 from dotenv import load_dotenv
+from token_generator import encrypt_id
 
 load_dotenv()
 
@@ -25,19 +26,22 @@ def init_db():
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id VARCHAR(255) PRIMARY KEY,
+                    encrypted_token TEXT UNIQUE NOT NULL,
                     session_created_timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     session_active_status BOOLEAN NOT NULL DEFAULT TRUE,
-                    session_inactivated_timestamp TIMESTAMP,
+                    session_inactivated_timestamp TIMESTAMP DEFAULT NULL,
                     last_active_timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS threads (
                     thread_id VARCHAR(255) PRIMARY KEY,
+                    encrypted_thread TEXT UNIQUE NOT NULL,
                     session_id VARCHAR(255) NOT NULL,
                     thread_created_timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     thread_active_status BOOLEAN NOT NULL DEFAULT TRUE,
                     last_active_timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    thread_inactivated_timestamp TIMESTAMP DEFAULT NULL,
                     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
                 )
             ''')
@@ -47,132 +51,222 @@ def init_db():
 
 def create_session():
     session_id = str(uuid.uuid4())
+    encrypted_token = encrypt_id(session_id)
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO sessions (session_id) VALUES (%s) RETURNING *",
-                (session_id,)
+                "INSERT INTO sessions (session_id, encrypted_token) VALUES (%s, %s) RETURNING encrypted_token",
+                (session_id, encrypted_token)
             )
             new_session = cur.fetchone()
         conn.commit()
-    return new_session[ 'session_id' ]
+    return new_session[ 'encrypted_token' ]
 
 
-def update_session_last_active(session_id):
+def validate_session_token(encrypted_token):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE sessions SET last_active_timestamp = CURRENT_TIMESTAMP WHERE session_id = %s RETURNING *",
-                (session_id,)
+                "SELECT * FROM sessions WHERE encrypted_token = %s AND session_active_status = TRUE",
+                (encrypted_token,)
             )
-            updated_session = cur.fetchone()
+            new_session = cur.fetchone()
         conn.commit()
-    return updated_session
+    if new_session and new_session[ 'encrypted_token' ]:
+        return True
+    else:
+        return False
 
 
-def create_thread(session_id):
-    thread_id = str(uuid.uuid4())
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO threads (thread_id, session_id) VALUES (%s, %s) RETURNING *",
-                (thread_id, session_id)
-            )
-            new_thread = cur.fetchone()
-        conn.commit()
-    return new_thread[ 'thread_id' ]
+def update_session_last_active(encrypted_token):
+    session = validate_session_token(encrypted_token)
+    if session:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE sessions SET last_active_timestamp = CURRENT_TIMESTAMP WHERE encrypted_token = %s "
+                    "RETURNING encrypted_token",
+                    (encrypted_token,)
+                )
+                updated_session = cur.fetchone()
+            conn.commit()
+        return updated_session[ 'encrypted_token' ]
+    return None
 
 
-def update_thread_last_active(thread_id):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE threads SET last_active_timestamp = CURRENT_TIMESTAMP WHERE thread_id = %s RETURNING *",
-                (thread_id,)
-            )
-            updated_thread = cur.fetchone()
-        conn.commit()
-    return updated_thread
+def create_thread(encrypted_token):
+    session = validate_session_token(encrypted_token)
+    if session:
+        thread_id = str(uuid.uuid4())
+        encrypted_thread = encrypt_id(thread_id)
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT session_id FROM threads WHERE thread_id = %s",
+                    (thread_id,)
+                )
+                session_id = cur.fetchone()
+                cur.execute(
+                    "INSERT INTO threads (thread_id, encrypted_thread, session_id) VALUES (%s, %s, %s) "
+                    "RETURNING encrypted_thread",
+                    (thread_id, encrypted_thread, session_id[ 'session_id' ])
+                )
+                new_thread = cur.fetchone()
+            conn.commit()
+        return new_thread[ 'encrypted_thread' ]
+    return None
 
 
-def get_session_id_from_thread(thread_id):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT session_id FROM threads WHERE thread_id = %s",
-                (thread_id,)
-            )
-            result = cur.fetchone()
-    return result[ 'session_id' ] if result else None
-
-
-def list_threads_for_session(session_id):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM threads WHERE session_id = %s ORDER BY last_active_timestamp DESC",
-                (session_id,)
-            )
-            threads = cur.fetchall()
-    return threads
-
-
-def get_latest_thread_for_session(session_id):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM threads WHERE session_id = %s ORDER BY last_active_timestamp DESC LIMIT 1",
-                (session_id,)
-            )
-            latest_thread = cur.fetchone()
-    return latest_thread
-
-
-def terminate_thread(thread_id):
+def validate_thread_token(encrypted_thread):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE threads 
-                SET thread_active_status = FALSE,
-                    thread_inactivated_timestamp = CURRENT_TIMESTAMP 
-                WHERE thread_id = %s
-                RETURNING *
+                SELECT t.*, s.session_active_status 
+                FROM threads t 
+                JOIN sessions s ON t.session_id = s.session_id 
+                WHERE t.encrypted_thread = %s AND t.thread_active_status = TRUE
                 """,
-                (thread_id,)
+                (encrypted_thread,)
             )
-            terminated_thread = cur.fetchone()
-        conn.commit()
-    return terminated_thread
+            thread = cur.fetchone()
+    if thread and thread[ 'encrypted_token' ] and thread[ 'encrypted_thread' ]:
+        return True
+    else:
+        return False
 
 
-def terminate_session(session_id):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            # Update all threads for the session
-            cur.execute(
-                """
-                UPDATE threads 
-                SET thread_active_status = FALSE,
-                    thread_inactivated_timestamp = CURRENT_TIMESTAMP 
-                WHERE session_id = %s
-                """,
-                (session_id,)
-            )
-            # Update the session
-            cur.execute(
-                """
-                UPDATE sessions 
-                SET session_active_status = FALSE, 
-                    session_inactivated_timestamp = CURRENT_TIMESTAMP 
-                WHERE session_id = %s 
-                RETURNING *
-                """,
-                (session_id,)
-            )
-            terminated_session = cur.fetchone()
-        conn.commit()
-    return terminated_session
+def update_thread_last_active(encrypted_thread):
+    thread = validate_thread_token(encrypted_thread)
+    if thread:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE threads SET last_active_timestamp = CURRENT_TIMESTAMP WHERE encrypted_thread = %s "
+                    "RETURNING encrypted_thread",
+                    (encrypted_thread,)
+                )
+                updated_thread = cur.fetchone()
+            conn.commit()
+        return updated_thread['encrypted_thread']
+    return None
+
+
+def get_encrypted_token_from_thread(encrypted_thread):
+    thread = validate_thread_token(encrypted_thread)
+    if thread:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT session_id FROM threads where encrypted_thread = %s",
+                    (encrypted_thread,)
+                )
+                session_id = cur.fetchone()
+                cur.execute(
+                    "SELECT encrypted_token FROM sessions WHERE session_id = %s",
+                    (session_id['session_id'],)
+                )
+                result = cur.fetchone()
+        return result['encrypted_token'] if result else None
+    return None
+
+
+def list_threads_for_session(encrypted_token):
+    session = validate_session_token(encrypted_token)
+    if session:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT session_id FROM sessions where encrypted_token = %s",
+                    (encrypted_token,)
+                )
+                session_id = cur.fetchone()
+                cur.execute(
+                    "SELECT encrypted_thread, last_active_timestamp FROM threads WHERE session_id = %s "
+                    "ORDER BY last_active_timestamp DESC",
+                    (session_id['session_id'],)
+                )
+                threads = cur.fetchall()
+        return threads
+    return None
+
+
+def get_latest_thread_for_session(encrypted_token):
+    session = validate_session_token(encrypted_token)
+    if session:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT session_id FROM sessions where encrypted_token = %s",
+                    (encrypted_token,)
+                )
+                session_id = cur.fetchone()
+                cur.execute(
+                    "SELECT encrypted_thread FROM threads WHERE session_id = %s "
+                    "ORDER BY last_active_timestamp DESC LIMIT 1",
+                    (session_id['session_id'],)
+                )
+                latest_thread = cur.fetchone()
+        return latest_thread[ 'encrypted_thread' ] if latest_thread else None
+    return None
+
+
+def terminate_thread(encrypted_thread):
+    thread = validate_thread_token(encrypted_thread)
+    if thread:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE threads 
+                    SET thread_active_status = FALSE,
+                        thread_inactivated_timestamp = CURRENT_TIMESTAMP 
+                    WHERE thread_id = %s
+                    RETURNING encrypted_thread
+                    """,
+                    (encrypted_thread,)
+                )
+                terminated_thread = cur.fetchone()
+            conn.commit()
+        return terminated_thread['encrypted_thread']
+    return None
+
+
+def terminate_session(encrypted_token):
+    session = validate_session_token(encrypted_token)
+    if session:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT session_id FROM sessions where encrypted_token = %s",
+                    (encrypted_token,)
+                )
+                session_id = cur.fetchone()
+                # Update all threads for the session
+                cur.execute(
+                    """
+                    UPDATE threads 
+                    SET thread_active_status = FALSE,
+                        thread_inactivated_timestamp = CURRENT_TIMESTAMP 
+                    WHERE session_id = %s
+                    """,
+                    (session_id['session_id'],)
+                )
+                # Update the session
+                cur.execute(
+                    """
+                    UPDATE sessions 
+                    SET session_active_status = FALSE, 
+                        session_inactivated_timestamp = CURRENT_TIMESTAMP 
+                    WHERE session_id = %s 
+                    RETURNING encrypted_token
+                    """,
+                    (session_id['session_id'],)
+                )
+                terminated_session = cur.fetchone()
+            conn.commit()
+        return terminated_session['encrypted_token']
+    return None
 
 
 # Call this function when starting your application
