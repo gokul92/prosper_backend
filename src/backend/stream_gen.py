@@ -1,18 +1,30 @@
 import asyncio
-import datetime
 import json
 import logging
 import os
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from openai import OpenAI
 from pydantic import BaseModel
 
-from db_operations import get_thread_id_from_token  # , add_thread_id_and_token
-from token_generator import generate_encrypted_token, match_encrypted_token
+from db_operations import (
+    create_session, validate_session_and_thread_tokens, get_latest_thread_for_session,
+    create_thread, update_session_last_active, update_thread_last_active
+)
+
+"""
+TODO -
+1. Format assistant instruction as a JSON response and parse JSON to display in UI
+2. Relatively high latency. Introduce a spinner/waiting/processing icon. Additionally, minimize latency
+3. Ask AI to provide 3 top follow-up questions.
+4. visual/gui workflow.
+5. Enhance UI to improve UX.
+6. 5 free messages, then sign up to use product.
+7. UI reboot
+"""
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,6 +45,16 @@ app.add_middleware(
 )
 
 
+@app.get('/get_session_token')
+async def get_session_token():
+    try:
+        encrypted_token = create_session()
+        return JSONResponse(content={"session_token": encrypted_token})
+    except Exception as e:
+        logger.error(f"Error generating session token: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to generate session token")
+
+
 async def stream_generator(thread_id, assistant_id):
     try:
         run = client.beta.threads.runs.create(
@@ -43,15 +65,21 @@ async def stream_generator(thread_id, assistant_id):
         while True:
             run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
             if run.status == 'completed':
+                # Retrieve messages, they are sorted with newest first
                 messages = client.beta.threads.messages.list(thread_id=thread_id)
-                for msg in messages:
-                    if msg.role == "assistant":
-                        for content in msg.content:
-                            if content.type == 'text':
-                                # Stream each word separately
-                                for word in content.text.value.split():
-                                    yield word + ' '
-                                    await asyncio.sleep(0.1)  # Small delay between words
+
+                # Find the most recent assistant message
+                latest_assistant_message = next((msg for msg in messages.data if msg.role == "assistant"), None)
+
+                if latest_assistant_message:
+                    for content in latest_assistant_message.content:
+                        if content.type == 'text':
+                            # Stream each word separately
+                            for word in content.text.value.split():
+                                yield word + ' '
+                                await asyncio.sleep(0.1)  # Small delay between words
+                else:
+                    logger.warning("No assistant message found in the thread.")
                 break
             elif run.status in [ 'failed', 'cancelled', 'expired' ]:
                 logger.error(f"Run ended with status: {run.status}")
@@ -64,8 +92,8 @@ async def stream_generator(thread_id, assistant_id):
 
 class UserMessage(BaseModel):
     prompt: str
-    session_token: None | str = None
-    expiry_time: None | int = None
+    session_token: str | None = None
+    thread_token: str | None = None
 
 
 @app.options("/chat/stream")
@@ -80,44 +108,48 @@ async def stream_ai_response(response: UserMessage):
 
     async def event_generator():
         try:
-            if (response_dict[ "session_token" ] is None) or (
-                    match_encrypted_token(response_dict[ 'session_token' ] is False)):
-                sess_token = str(generate_encrypted_token())
+            session_token = response_dict[ "session_token" ]
+            thread_token = response_dict[ "thread_token" ]
+
+            # Validate tokens
+            token_status = validate_session_and_thread_tokens(session_token, thread_token)
+            logger.info(f"Token status: {token_status}")
+
+            if not token_status[ 'session' ]:
+                # Create new session and thread
+                session_token = create_session()
                 new_thread = client.beta.threads.create(
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": response_dict[ 'prompt' ],
-                            "metadata": {
-                                "token": sess_token,
-                                "expiry_time": str(datetime.datetime.now().timestamp() + (24 * 60 * 60)),
-                                "time_format": "unix_time"
-                            }
-                        }
-                    ]
+                    messages=[ {"role": "user", "content": response_dict[ 'prompt' ]} ]
                 )
                 thread_id = new_thread.id
-                # TODO: Uncomment when ready to use database
-                # background_tasks.add_task(add_thread_id_and_token, thread_id, sess_token)
+                thread_token = create_thread(session_token, thread_id)
+            elif token_status[ 'session' ] and (not token_status[ 'thread' ]):
+                # Create new thread for existing session
+                new_thread = client.beta.threads.create(
+                    messages=[ {"role": "user", "content": response_dict[ 'prompt' ]} ]
+                )
+                thread_id = new_thread.id
+                thread_token = create_thread(session_token, thread_id)
             else:
-                thread_id = get_thread_id_from_token(bytes(response_dict[ "session_token" ], 'utf-8'))
-
+                # Use existing thread
+                thread_id = get_latest_thread_for_session(session_token)
                 client.beta.threads.messages.create(
                     thread_id=thread_id,
                     role="user",
-                    content=response_dict[ "prompt" ],
-                    metadata={
-                        "token": response_dict[ "session_token" ],
-                        "expiry_time": "556678",  # replace with token expiry from db
-                        "time_format": "unix_time"
-                    }
+                    content=response_dict[ "prompt" ]
                 )
+
+            # Update last active timestamps
+            update_session_last_active(session_token)
+            update_thread_last_active(thread_token)
 
             async for chunk in stream_generator(thread_id=thread_id, assistant_id="asst_9od8x1PjV2GbjOcriSNcl2ph"):
                 if chunk is None:
                     break
                 yield f"data: {json.dumps({'type': 'message', 'content': chunk})}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'content': 'Stream finished'})}\n\n"
+
+                # Include session and thread tokens in the final response
+                yield f"data: {json.dumps({'type': 'done', 'content': 'Stream finished', 'session_token': session_token, 'thread_token': thread_token})}\n\n"
         except Exception as e:
             logger.error(f"Error in event_generator: {str(e)}")
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
