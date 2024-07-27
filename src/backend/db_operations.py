@@ -14,6 +14,13 @@ db_pass = os.getenv('DB_PASSWORD')
 db_name = os.getenv('DB_NAME')
 db_port = os.getenv('DB_PORT')
 
+"""
+TODO 
+retrieve all messages associated with a thread from openai
+retrieve all messages assoociated with a user from openai
+retrieve latest message associated with a thread from openai
+"""
+
 
 def get_connection():
     return psycopg.connect(f'host={db_host} port={db_port} dbname={db_name} user={db_user} password={db_pass}',
@@ -102,9 +109,10 @@ def create_thread(encrypted_token, thread_id=None):
         encrypted_thread = encrypt_id(thread_id)
         with get_connection() as conn:
             with conn.cursor() as cur:
+                # Get the session_id from the sessions table
                 cur.execute(
-                    "SELECT session_id FROM threads WHERE thread_id = %s",
-                    (thread_id,)
+                    "SELECT session_id FROM sessions WHERE encrypted_token = %s",
+                    (encrypted_token,)
                 )
                 session_id = cur.fetchone()
                 cur.execute(
@@ -113,8 +121,8 @@ def create_thread(encrypted_token, thread_id=None):
                     (thread_id, encrypted_thread, session_id[ 'session_id' ])
                 )
                 new_thread = cur.fetchone()
-            conn.commit()
-        return new_thread[ 'encrypted_thread' ]
+                conn.commit()
+                return new_thread[ 'encrypted_thread' ]
     return None
 
 
@@ -131,7 +139,7 @@ def validate_thread_token(encrypted_thread):
                 (encrypted_thread,)
             )
             thread = cur.fetchone()
-    if thread and thread[ 'encrypted_token' ] and thread[ 'encrypted_thread' ]:
+    if thread and thread[ 'encrypted_thread' ]:
         return True
     else:
         return False
@@ -172,6 +180,30 @@ def get_encrypted_token_from_thread(encrypted_thread):
     return None
 
 
+def validate_session_and_thread_tokens(encrypted_session_token, encrypted_thread_token=None):
+    session_valid = validate_session_token(encrypted_session_token)
+
+    if not session_valid:
+        return {'session': False,
+                'thread': False}
+
+    if encrypted_thread_token == '' and session_valid:
+        return {'session': True,
+                'thread': False}
+
+    thread_valid = validate_thread_token(encrypted_thread_token)
+
+    if thread_valid and session_valid:
+        # Check if the thread belongs to the session
+        thread_session_token = get_encrypted_token_from_thread(encrypted_thread_token)
+        if thread_session_token == encrypted_session_token:
+            return {'session': True,
+                    'thread': True}
+        else:
+            return {'session': True,
+                    'thread': False}
+
+
 def list_threads_for_session(encrypted_token):
     session = validate_session_token(encrypted_token)
     if session:
@@ -203,7 +235,7 @@ def get_latest_thread_for_session(encrypted_token):
                 )
                 session_id = cur.fetchone()
                 cur.execute(
-                    "SELECT thread_id FROM threads WHERE session_id = %s "
+                    "SELECT thread_id FROM threads WHERE session_id = %s AND thread_active_status = TRUE "
                     "ORDER BY last_active_timestamp DESC LIMIT 1",
                     (session_id[ 'session_id' ],)
                 )
