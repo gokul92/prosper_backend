@@ -1,0 +1,54 @@
+{
+  "intent_classification": {
+    "user_intent_primary_category": "String. The primary category to which the user query or statement belongs. It should be one of the following - 1. taxes - pertaining to investment taxes, what they are, or how to minimize them. Examples are tax loss harvesting, Roth conversion limits, backdoor Roth conversions, account rollovers, taxable account withdrawal taxes, gains deferral/gains harvesting, etc. 2. fees - any explicit or implicit fees associated with investments such as transaction charges, bid-ask spread, expense ratios, mutual fund fees, etc. 3. risks - risks associated with owning investments, such as concentrated positions in a security, diversification, volatility, drawdown, interest rates, inflation, etc. 4. returns - associated with future market performance, market return statistics, beating the market, future wealth projections across taxable and tax-deferred accounts, probability of reaching a financial goal, etc. 5. other - does not belong to one of the above 4 categories",
+    "user_intent_secondary_category": "String. Can be one of 1. taxes, 2. fees, 3. risks, 4. returns, 5. other 6. ''. If user_intent_primary_category is other, then user_intent_secondary_category has to be ''.",
+    "user_question_primary_category_rationale": "String. Explain why you chose the specific primary category. justify your choice with explicit quotes from the user's statement/query.",
+    "user_question_secondary_category_rationale": "String. Explain why you chose the specific secondary category if it is not ''. Justify your choice with explicit passages from the user's statement/query if it is not other or ''."
+  },
+  "ambiguity_assessment": {
+    "intent_ambiguity": {
+      "description": "String. Identify and describe what you find ambiguous about the user's intent. If necessary, use previous messages from the user related to this topic.",
+      "ambiguity": "Number. Quantify how ambiguous the user's intent is. The number should range from 0 to 1, where 0 denotes no ambiguity and 1 denotes maximal ambiguity.",
+      "importance_score": "Number. How important is this on a scale of 0 to 1 to be able to effectively answer the user's query?"
+    },
+    "purpose_ambiguity": {
+      "description": "String. Identify and describe what you find ambiguous about the user's purpose. Why have they posed the question? What's their motivation? 1. Are they looking to buy a house? 2. Are they looking to save for their kid’s education? 3. Are they saving up for an important expense? 4. Are they getting married? 5. Are they planning for retirement? 6. Other? If necessary, use previous messages from the user related to this topic.",
+      "ambiguity": "Number. Quantify how ambiguous the user's purpose is. The number should range from 0 to 1, where 0 denotes no ambiguity and 1 denotes maximal ambiguity.",
+      "importance_score": "Number. How important is this on a scale of 0 to 1 to be able to effectively answer the user's query?"
+    },
+    "persona_ambiguity": {
+      "description": "String. Identify and describe what you find ambiguous about the user's purpose or their nature. 1. Who is the person posing the query? 2. What’s the person’s profession? 3. What’s their age? 4. Do they have a family and kids? 5. What’s their educational background? 6. Level of expertise with finances and investing?",
+      "ambiguity": "Number. Quantify how ambiguous the user's persona is. The number should range from 0 to 1, where 0 denotes no ambiguity and 1 denotes maximal ambiguity.",
+      "importance_score": "Number. How important is this on a scale of 0 to 1 to be able to effectively answer the user's query?"
+    },
+    "total_clarity": "Number. A number from 0 to 1 calculated as (1 - intent_ambiguity) * (1 - purpose_ambiguity) * (1 - persona_ambiguity). Use the ambiguities quantified previously.",
+    "total_ambiguity": "Number. 1 - total_clarity"
+  },
+  "ambiguity_clarification": {
+    "maximal_ambiguity_source": "String. Based on the respective importance scores and magnitudes of the different forms of ambiguity, specify which is the aspect that needs further clarification from the user to enable an effective response? Should be one of - intent, purpose, persona or empty string if everything is clear.",
+    "ambiguity_boolean": "Boolean. Is ambiguity less than or greater than 0.25? A Boolean True or False",
+    "annoyance": "Boolean. Is the user annoyed? Boolean True or False.",
+    "response": {
+      "response_type": "String. If total_ambiguity is <= 0.25 OR if the user is annoyed OR if the user refuses to answer any follow-up question, then this field should be 'answer'. Else if total_ambiguity > 0.25, then this field should be 'question'. Structure the response as a list of JSON objects with heading and content entries as shown below.",
+      "response_structure": [
+        {
+          "heading": "response_structure can be a list of JSON objects, minimum size of 1. If you have a simple statement or question to pose to the user then keep heading an empty string, set numbered_list to False and specify the statement/question in the content section. If you have an elaborate response with multiple headings and sections, then use multiple JSON objects as required.Specify any formatting using Markdown.",
+          "numbered_list": "Boolean. True if content is numbered list else False if content is empty or content is not a numbered list. Do not use response_structure section for citations/references or additional resources. There is a separate section for that.",
+          "content": "String if numbered_list is False. If Numbered list is True, then it is a list of strings. Each item in the numbered list is one entry in the list of strings."
+        },
+        {
+          "heading": "If you have an elaborate response, then use the list of JSON objects to categorize the response into multiple headings and respective content sections.",
+          "numbered_list": "Boolean. False if content is empty or a paragraph. Use numbered lists if content is large in size.",
+          "content": "Place text associated with a particular heading in the content section."
+        }
+      ]
+    },
+    "citations": [
+      "If the response includes an answer, then backup your answer with citations here.",
+      "List of strings, with each string as a citation/references or additional resource.",
+      "Link to citation 1",
+      "Link to citation 2",
+      "If no citations, then leave it as an empty list."
+    ]
+  }
+}
