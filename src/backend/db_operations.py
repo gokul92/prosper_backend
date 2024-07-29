@@ -244,6 +244,25 @@ def get_latest_thread_for_session(encrypted_token):
     return None
 
 
+def get_thread_id_from_encrypted_thread_token(encrypted_token, encrypted_thread):
+    session = validate_session_token(encrypted_token)
+    if session:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT session_id FROM sessions where encrypted_token = %s",
+                    (encrypted_token,)
+                )
+                session_id = cur.fetchone()
+                cur.execute(
+                    "SELECT thread_id FROM threads WHERE session_id = %s AND encrypted_thread = %s",
+                    (session_id[ 'session_id' ], encrypted_thread,)
+                )
+                thread_id = cur.fetchone()
+        return thread_id[ 'thread_id' ] if thread_id else None
+    return None
+
+
 def terminate_thread(encrypted_thread):
     thread = validate_thread_token(encrypted_thread)
     if thread:
