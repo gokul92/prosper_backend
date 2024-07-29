@@ -251,7 +251,20 @@ async def execute_run(thread_id, thread_token, session_token, prompt):
         if latest_assistant_message:
             for content in latest_assistant_message.content:
                 if content.type == 'text':
-                    ai_response = json.loads(content.text.value)
+                    # logger.info(f"Content type: {type(content.text.value)}")
+                    # logger.info(f"Content value: {content.text.value}")
+
+                    try:
+                        ai_response = json.loads(content.text.value)
+                        response_structure = ai_response[ 'ambiguity_clarification' ][ 'response' ][
+                            'response_structure' ]
+                    except json.JSONDecodeError:
+                        # If content.text.value is not JSON, return it as is
+                        response_structure = {"type": "error", "content": "text not in JSON format"}
+                    except KeyError:
+                        # If the expected structure is not found, return the whole response
+                        response_structure = {"type": "error", "content": "Key error - JSON structure not as expected."}
+
                     return {
                         "response": ai_response[ 'ambiguity_clarification' ][ 'response' ],
                         "session_token": session_token,
