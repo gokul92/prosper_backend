@@ -266,7 +266,7 @@ async def execute_run(thread_id, thread_token, session_token, prompt):
                         response_structure = {"type": "error", "content": "Key error - JSON structure not as expected."}
 
                     return {
-                        "response": ai_response[ 'ambiguity_clarification' ][ 'response' ],
+                        "response": response_structure,
                         "session_token": session_token,
                         "thread_token": thread_token
                     }
