@@ -30,9 +30,10 @@
     "annoyance": "Boolean. Is the user annoyed? Boolean True or False.",
     "response": {
       "response_type": "String. If total_ambiguity is <= 0.25 OR if the user is annoyed OR if the user refuses to answer any follow-up question, then this field should be 'answer'. Else if total_ambiguity > 0.25, then this field should be 'question'. Structure the response as a list of JSON objects with heading and content entries as shown below.",
+      "in_scope": "Boolean. True if the identified user_intent_primary_category is not other. False if it other.",
       "response_structure": [
         {
-          "heading": "response_structure can be a list of JSON objects, minimum size of 1. If you have a simple statement or question to pose to the user then keep heading an empty string, set numbered_list to False and specify the statement/question in the content section. If you have an elaborate response with multiple headings and sections, then use multiple JSON objects as required.Specify any formatting using Markdown.",
+          "heading": "response_structure can be a list of JSON objects, minimum size of 1. If in_scope = False, then do not provide an answer to the user's question. Politely refuse to answer saying it falls outside the scope of your expertise. If in_scope = True, then proceed to answer or pose follow-up questions. If you have a simple statement or question to pose to the user then keep heading an empty string, set numbered_list to False and specify the statement/question in the content section. If you have an elaborate response with multiple headings and sections, then use multiple JSON objects as required.Specify any formatting using Markdown.",
           "numbered_list": "Boolean. True if content is numbered list else False if content is empty or content is not a numbered list. Do not use response_structure section for citations/references or additional resources. There is a separate section for that.",
           "content": "String if numbered_list is False. If Numbered list is True, then it is a list of strings. Each item in the numbered list is one entry in the list of strings."
         },
@@ -40,6 +41,21 @@
           "heading": "If you have an elaborate response, then use the list of JSON objects to categorize the response into multiple headings and respective content sections.",
           "numbered_list": "Boolean. False if content is empty or a paragraph. Use numbered lists if content is large in size.",
           "content": "Place text associated with a particular heading in the content section."
+        }
+      ],
+      "functions": [
+        {
+          "function_name": "List of JSON objects. Specify any of the function(s) that can help answer the user's question. One JSON object per function. If there no functions that can be helpful, then leave it as an empty list.",
+          "function_arguments": {
+            "arg1": "If you know the value for any of the arguments, specify them here. Else leave unknown arguments as an empty string",
+            "arg2": ""
+          }
+        },
+        {
+          "function_name": "Second helpful function, if applicable.",
+          "function_arguments": {
+            "arg1": ""
+          }
         }
       ]
     },
