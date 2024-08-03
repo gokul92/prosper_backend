@@ -57,7 +57,13 @@
             "arg1": ""
           }
         }
-      ]
+      ],
+      "follow_up_questions":
+        {
+          "question_1": "String. Put yourself in the shoes of the typical user asking these questions. They are trying to solve some problem that can help them increase returns or decrease investment risk, hidden fees or taxes paid. Based on your understanding of their problems, background and situation as of now combined with your expertise in investing, come up with specific, succinct follow-up questions that the user should ask you to maximize their chances of an effective answer. Pose the question role-playing as the user. If any of these questions encourage the use of available functions that solve the user's problems, then they are preferable. question_1 should hold your first question and the most recommended one.",
+          "question_2": "string. second question. Leave empty if no question",
+          "question_3": "string. third question. Leave empty if no question"
+        }
     },
     "citations": [
       "If the response includes an answer, then backup your answer with citations here.",
