@@ -1,10 +1,11 @@
-import sys, getopt
+import sys
+import getopt
 import os
 import requests
 import psycopg
 from psycopg.rows import dict_row
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from dotenv import load_dotenv
 import concurrent.futures
 import time
@@ -19,13 +20,12 @@ db_user = os.getenv('DB_USERNAME')
 db_pass = os.getenv('DB_PASSWORD')
 db_name = os.getenv('DB_NAME')
 db_port = os.getenv('DB_PORT')
-mstar_equity_token = os.getenv('MSTAR_EQUIY_TOKEN')
+mstar_equity_token = os.getenv('MSTAR_EQUITY_TOKEN')
 mstar_symbol_guide_username = os.getenv('MSTAR_SYMBOL_GUIDE_USERNAME')
 mstar_symbol_guide_password = os.getenv('MSTAR_SYMBOL_GUIDE_PASSWORD')
 
 # Constants
 BASE_URL = "https://equityapi.morningstar.com/Webservice/"
-SYMBOL_GUIDE_URL = "http://mshxml.morningstar.com/symbolGuide"
 EQUITY_API_PARAMS = {"responseType": "Json",
                      "Token": mstar_equity_token}
 
@@ -34,7 +34,11 @@ logging.basicConfig(filename='equity_data_fetcher.log', level=logging.INFO,
 
 # CSV logger setup
 csv_log_file = 'process_times.csv'
-csv_fields = ['timestamp', 'process', 'duration']
+csv_fields = [ 'timestamp', 'process', 'duration' ]
+
+
+# TODO - Add latest share price, market cap/AUM for equities
+# TODO - Add depository receipt security type - ADR 'Depository-Receipt' - S1735
 
 
 def log_to_csv(process, duration):
@@ -84,6 +88,16 @@ def init_db():
                     created_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS equities_dividend_yield (
+                    symbol TEXT NOT NULL,
+                    company_name TEXT NOT NULL,
+                    date DATE NOT NULL,
+                    as_of_date DATE NOT NULL,
+                    dividend_yield DOUBLE PRECISION,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+            )
+            """)
             conn.commit()
 
 
@@ -99,16 +113,44 @@ def add_to_db(df, table_name):
 
 
 def get_symbol_guide():
-    params = {
-        "username": mstar_symbol_guide_username,
-        "password": mstar_symbol_guide_password,
-        "exchange": "126",
-        "security": "1",
-        "JSONShort": ""
-    }
-    response = requests.get(SYMBOL_GUIDE_URL, params={**params})
+    SYMBOL_GUIDE_URL = f"http://mshxml.morningstar.com/symbolGuide?username={mstar_symbol_guide_username}&password={mstar_symbol_guide_password}&exchange=126&security=1&JSONShort"
+    response = requests.get(SYMBOL_GUIDE_URL)
     df = pd.DataFrame(response.json()[ 'quotes' ][ 'results' ])
     return df[ [ 'H1', 'S12', 'S19', 'S1735', 'S1736', 'S3059' ] ].to_dict(orient='records')
+
+
+def get_dividend_yield(security):
+    div_yield_params = {
+        "exchangeId": security[ 'S1736' ],
+        "identifierType": "Symbol",
+        "identifier": security[ "H1" ],
+        "period": "Snapshot"
+    }
+    url = f"{BASE_URL}FinancialKeyRatiosService.asmx/GetValuationRatios"
+    response = requests.get(url, params={**EQUITY_API_PARAMS, **div_yield_params,
+                                         "category": "GetValuationRatios"})
+
+    if response.json()['MessageInfo']['MessageCode'] == 200:
+        company_name = response.json()[ 'GeneralInfo' ]['CompanyName']
+        data = response.json()[ 'ValuationRatioEntityList' ]
+
+        if data:
+            temp = data[ 0 ]
+            try:
+                return {
+                    'Symbol': security[ 'H1' ],
+                    'CompanyName': company_name,
+                    'Date': temp[ 'AsOfDate' ],
+                    'DividendYield': temp[ 'DividendYield' ]
+                }
+            except KeyError:
+                return {
+                    'Symbol': security[ 'H1' ],
+                    'CompanyName': company_name,
+                    'Date': temp[ 'AsOfDate' ],
+                    'DividendYield': 0.0
+                }
+    return {}
 
 
 def get_equity_classification(security):
@@ -157,15 +199,15 @@ def get_price_index(security, start_date, end_date, as_of_date):
     dmri[ 'Symbol' ] = security[ 'H1' ]
     dmri[ 'SecurityType' ] = security[ 'S1735' ]
     dmri[ 'SecurityName' ] = security[ 'S12' ]
-    dmri['as_of_date'] = as_of_date
+    dmri[ 'as_of_date' ] = as_of_date
 
-    dmri.columns = ['date', 'value', 'symbol', 'security_type', 'security_name', 'as_of_date']
+    dmri.columns = [ 'date', 'value', 'symbol', 'security_type', 'security_name', 'as_of_date' ]
 
     return dmri
 
 
 def process_security(security, as_of_date, latest_date='2024-07-31', db_bool=True):
-    logging.info(f"Processing security: {security['H1']}")
+    logging.info(f"Processing security: {security[ 'H1' ]}")
     latest_date_obj = datetime.strptime(latest_date, '%Y-%m-%d')
     all_data = [ ]
 
@@ -213,16 +255,15 @@ def fetch_equity_performance(symbols, start_date, end_date, as_of_date):
             return cur.fetchall()
 
 
-def main(eq_perf_bool, eq_char_bool, num_workers=25):
+def main(eq_perf_bool, eq_ind_bool, eq_yield_bool, as_of_date, num_workers=25):
     init_db()
     symbol_guide_mstar = get_symbol_guide()
-    as_of_date = '2024-08-01'
-    if eq_char_bool:
+    if eq_ind_bool:
         start_time_equity_classification = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
             equity_classification_results = list(executor.map(get_equity_classification, symbol_guide_mstar))
             equity_classification_df = pd.DataFrame(equity_classification_results).dropna(subset='Symbol')
-            equity_classification_df['as_of_date'] = as_of_date
+            equity_classification_df[ 'as_of_date' ] = as_of_date
             equity_classification_df.columns = [ 'symbol', 'security_name', 'start_year', 'end_year', 'sector_id',
                                                  'sector_name', 'industry_group_id', 'industry_group_name',
                                                  'industry_id', 'industry_name', 'as_of_date' ]
@@ -231,6 +272,20 @@ def main(eq_perf_bool, eq_char_bool, num_workers=25):
         duration = end_time_equity_classification - start_time_equity_classification
         log_to_csv('Equity Classification', duration)
         logging.info(f"Equity classification completed in {duration:.2f} seconds")
+
+    if eq_yield_bool:
+        start_time_dividend_yield = time.time()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+            dividend_yield_results = list(executor.map(get_dividend_yield, symbol_guide_mstar))
+            dividend_yield_results = [d for d in dividend_yield_results if d != {}]
+            dividend_yield_df = pd.DataFrame(dividend_yield_results).dropna(subset='Symbol')
+            dividend_yield_df[ 'as_of_date' ] = as_of_date
+            dividend_yield_df.columns = [ 'symbol', 'company_name', 'date', 'dividend_yield', 'as_of_date' ]
+            add_to_db(dividend_yield_df, 'equities_dividend_yield')
+        end_time_dividend_yield = time.time()
+        duration = end_time_dividend_yield - start_time_dividend_yield
+        log_to_csv('Yield Classification', duration)
+        logging.info(f"Yield classification completed in {duration:.2f} seconds")
 
     if eq_perf_bool:
         start_time_equity_performance = time.time()
@@ -243,17 +298,23 @@ def main(eq_perf_bool, eq_char_bool, num_workers=25):
 
 
 if __name__ == "__main__":
-    opts, args = getopt.getopt(sys.argv[ 1: ], "pcw:", [ "performance", "classification", "workers=" ])
+    opts, args = getopt.getopt(sys.argv[ 1: ], "piydw:", [ "performance", "industry", "yield", "date=", "workers=" ])
     eqpb = False
-    eqcb = False
+    eqib = False
+    eqyb = False
+    dt = date.today().strftime('%Y-%m-%d')
     nw = 25
 
     for opt, arg in opts:
         if opt in ("-p", "--performance"):
             eqpb = True
-        elif opt in ("-c", "--classification"):
+        elif opt in ("-i", "--industry"):
             eqcb = True
+        elif opt in ("-y", "--yield"):
+            eqyb = True
+        elif opt in ("-d", "--date"):
+            dt = arg
         elif opt in ("-w", "--workers"):
             nw = int(arg)
 
-    main(eqpb, eqcb, nw)
+    main(eqpb, eqib, eqyb, nw)
