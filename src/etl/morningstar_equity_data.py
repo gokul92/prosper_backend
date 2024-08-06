@@ -38,7 +38,9 @@ csv_log_file = 'process_times.csv'
 csv_fields = [ 'timestamp', 'process', 'duration' ]
 
 
-# TODO - Add latest share price, market cap/AUM for equities
+# TODO - modify to fetch info as of last as_of_date lower than your specified date if latter does not exist
+# TODO - add fetch functions for all equities tables
+# TODO - create primary keys for tables hat don't have them
 # TODO - Add depository receipt security type - ADR 'Depository-Receipt' - S1735
 
 
@@ -120,6 +122,25 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_equities_daily_price_history_created_at ON equities_daily_price_history(created_at);
 
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS equities_market_capitalization (
+                symbol TEXT NOT NULL,
+                company_name TEXT,
+                date DATE NOT NULL,
+                market_cap DOUBLE PRECISION,
+                enterprise_value DOUBLE PRECISION,
+                shares_outstanding DOUBLE PRECISION,
+                shares_date DATE,
+                as_of_date DATE NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT pk_equities_market_capitalization PRIMARY KEY (symbol, as_of_date, date)
+            );
+            
+            -- Create indexes for faster querying
+            CREATE INDEX IF NOT EXISTS idx_equities_market_cap_symbol ON equities_market_capitalization(symbol);
+            CREATE INDEX IF NOT EXISTS idx_equities_market_cap_date ON equities_market_capitalization(date);
+            CREATE INDEX IF NOT EXISTS idx_equities_market_cap_as_of_date ON equities_market_capitalization(as_of_date);
+            """)
             conn.commit()
 
 
@@ -149,13 +170,9 @@ def get_market_price_history(security, start_date, end_date, as_of_date):
         "startDate": start_date,
         "endDate": end_date
     }
-    # print(start_date, end_date, as_of_date)
     url = f"{BASE_URL}GlobalStockPricesService.asmx/GetEODPriceHistory"
     response = requests.get(url, params={**EQUITY_API_PARAMS, **mkt_price_params,
                                          "category": "GetEODPriceHistory"})
-    # response.raise_for_status()  # This will raise an exception for HTTP errors
-    # logging.info(f"Received response for {security[ 'H1' ]}")
-    # print(f"Response for {security[ 'H1' ]}:", response.text)  # Print raw response
     if response.json()[ 'MessageInfo' ][ 'MessageCode' ] == 200:
         company_name = response.json()[ 'GeneralInfo' ][ 'CompanyName' ]
         data = response.json()[ 'EODPriceEntityList' ]
@@ -173,7 +190,29 @@ def get_market_price_history(security, start_date, end_date, as_of_date):
 
 
 def get_market_capitalization(security):
-    pass
+    market_cap_params = {
+        'exchangeId': security[ 'S1736' ],
+        "identifierType": "Symbol",
+        "identifier": security[ "H1" ]
+    }
+    url = f"{BASE_URL}MarketPerformanceService.asmx/GetCurrentMarketCapitalization"
+    response = requests.get(url, params={**EQUITY_API_PARAMS, **market_cap_params,
+                                         "category": "GetCurrentMarketCapitalization"})
+    if response.json()[ 'MessageInfo' ][ 'MessageCode' ] == 200:
+        company_name = response.json()[ 'GeneralInfo' ][ 'CompanyName' ]
+        data = response.json()[ 'MarketCapitalizationEntityList' ]
+        if data:
+            temp = data[ 0 ]
+            return {
+                'Symbol': security[ 'H1' ],
+                'CompanyName': company_name,
+                'Date': temp[ 'MarketCapDate' ],
+                'MarketCap': temp[ 'MarketCap' ],
+                'EnterpriseValue': temp[ 'EnterpriseValue' ],
+                'SharesOutstanding': temp[ 'SharesOutstanding' ],
+                'SharesDate': temp[ 'SharesDate' ]
+            }
+    return {}
 
 
 def get_dividend_yield(security):
@@ -311,19 +350,20 @@ def fetch_equity_performance(symbols, start_date, end_date, as_of_date):
             return cur.fetchall()
 
 
-def main(eq_perf_bool, eq_ind_bool, eq_yield_bool, eq_price_hist_bool, num_workers, as_of_date, start_date, end_date):
+def main(eq_perf_bool, eq_ind_bool, eq_yield_bool, eq_price_hist_bool, mcap_bool, num_workers, as_of_date, start_date,
+         end_date):
     init_db()
     symbol_guide_mstar = get_symbol_guide()
     if eq_ind_bool:
         start_time_equity_classification = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
             equity_classification_results = list(executor.map(get_equity_classification, symbol_guide_mstar))
-            equity_classification_df = pd.DataFrame(equity_classification_results).dropna(subset='Symbol')
-            equity_classification_df[ 'as_of_date' ] = as_of_date
-            equity_classification_df.columns = [ 'symbol', 'security_name', 'start_year', 'end_year', 'sector_id',
-                                                 'sector_name', 'industry_group_id', 'industry_group_name',
-                                                 'industry_id', 'industry_name', 'as_of_date' ]
-            add_to_db(equity_classification_df, 'daily_industry_sector_classification')
+        equity_classification_df = pd.DataFrame(equity_classification_results).dropna(subset='Symbol')
+        equity_classification_df[ 'as_of_date' ] = as_of_date
+        equity_classification_df.columns = [ 'symbol', 'security_name', 'start_year', 'end_year', 'sector_id',
+                                             'sector_name', 'industry_group_id', 'industry_group_name',
+                                             'industry_id', 'industry_name', 'as_of_date' ]
+        add_to_db(equity_classification_df, 'daily_industry_sector_classification')
         end_time_equity_classification = time.time()
         duration = end_time_equity_classification - start_time_equity_classification
         log_to_csv('Equity Classification', duration)
@@ -333,21 +373,19 @@ def main(eq_perf_bool, eq_ind_bool, eq_yield_bool, eq_price_hist_bool, num_worke
         start_time_dividend_yield = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
             dividend_yield_results = list(executor.map(get_dividend_yield, symbol_guide_mstar))
-            dividend_yield_results = [ d for d in dividend_yield_results if d != {} ]
-            dividend_yield_df = pd.DataFrame(dividend_yield_results).dropna(subset='Symbol')
-            dividend_yield_df[ 'as_of_date' ] = as_of_date
-            dividend_yield_df.columns = [ 'symbol', 'company_name', 'date', 'dividend_yield', 'as_of_date' ]
-            add_to_db(dividend_yield_df, 'equities_dividend_yield')
+        dividend_yield_results = [ d for d in dividend_yield_results if d != {} ]
+        dividend_yield_df = pd.DataFrame(dividend_yield_results).dropna(subset='Symbol')
+        dividend_yield_df[ 'as_of_date' ] = as_of_date
+        dividend_yield_df.columns = [ 'symbol', 'company_name', 'date', 'dividend_yield', 'as_of_date' ]
+        add_to_db(dividend_yield_df, 'equities_dividend_yield')
         end_time_dividend_yield = time.time()
         duration = end_time_dividend_yield - start_time_dividend_yield
         log_to_csv('Yield Classification', duration)
         logging.info(f"Yield classification completed in {duration:.2f} seconds")
 
     if eq_price_hist_bool and start_date is not None and end_date is not None:
-        # print("entered price history")
         start_time_price_hist = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # executor.map(get_market_price_history, symbol_guide_mstar, start_date, end_date, as_of_date)
             partial_func = partial(get_market_price_history, start_date=start_date, end_date=end_date,
                                    as_of_date=as_of_date)
             executor.map(partial_func, symbol_guide_mstar)
@@ -356,10 +394,26 @@ def main(eq_perf_bool, eq_ind_bool, eq_yield_bool, eq_price_hist_bool, num_worke
         log_to_csv('Price History', duration)
         logging.info(f"Price history completed in {duration:.2f} seconds")
 
+    if mcap_bool:
+        start_time_mcap = time.time()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+            mcap_result = list(executor.map(get_market_capitalization, symbol_guide_mstar))
+        mcap_result = [ d for d in mcap_result if d != {} ]
+        mcap_df = pd.DataFrame(mcap_result).dropna(subset='Symbol')
+        mcap_df[ 'as_of_date' ] = as_of_date
+        mcap_df.columns = [ 'symbol', 'company_name', 'date', 'market_cap', 'enterprise_value',
+                            'shares_outstanding', 'shares_date', 'as_of_date' ]
+        add_to_db(mcap_df, 'equities_market_capitalization')
+        end_time_mcap = time.time()
+        duration = end_time_mcap - start_time_mcap
+        log_to_csv('Market Capitalization', duration)
+        logging.info(f"Market cap completed in {duration:.2f} seconds")
+
     if eq_perf_bool:
         start_time_equity_performance = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-            executor.map(process_security, symbol_guide_mstar, as_of_date)
+            partial_func = partial(process_security, as_of_date)
+            executor.map(partial_func, symbol_guide_mstar)
         end_time_equity_performance = time.time()
         duration = end_time_equity_performance - start_time_equity_performance
         log_to_csv('Equity Performance', duration)
@@ -367,13 +421,14 @@ def main(eq_perf_bool, eq_ind_bool, eq_yield_bool, eq_price_hist_bool, num_worke
 
 
 if __name__ == "__main__":
-    opts, args = getopt.getopt(sys.argv[ 1: ], "piyhw:d:e:a:",
-                               [ "performance", "industry", "yield", "history", "workers=", "date=", "end_date=",
-                                 "days=" ])
+    opts, args = getopt.getopt(sys.argv[ 1: ], "piyhmw:d:e:a:",
+                               [ "performance", "industry", "yield", "history", "mcap", "workers=", "date=",
+                                 "end_date=", "days=" ])
     perf = False
     industry = False
     yld = False
     history = False
+    mcap = False
     n_workers = 25
     as_of_date = date.today().strftime('%Y-%m-%d')
     start_date = None
@@ -389,6 +444,8 @@ if __name__ == "__main__":
             yld = True
         elif opt in ("-h", "--history"):
             history = True
+        elif opt in ("-m", "--mcap"):
+            mcap = True
         elif opt in ("-w", "--workers"):
             n_workers = int(arg)
         elif opt in ("-d", "--date"):
@@ -401,4 +458,4 @@ if __name__ == "__main__":
                 end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
                 start_date = (end_date_obj - timedelta(days=num_days)).strftime("%Y-%m-%d")
 
-    main(perf, industry, yld, history, n_workers, as_of_date, start_date, end_date)
+    main(perf, industry, yld, history, mcap, n_workers, as_of_date, start_date, end_date)
