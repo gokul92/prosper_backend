@@ -5,6 +5,7 @@ import requests
 import psycopg
 from psycopg.rows import dict_row
 import pandas as pd
+from typing import Dict, List, Union
 from datetime import date, datetime, timedelta
 from dotenv import load_dotenv
 import concurrent.futures
@@ -38,9 +39,6 @@ csv_log_file = 'process_times.csv'
 csv_fields = [ 'timestamp', 'process', 'duration' ]
 
 
-# TODO - modify to fetch info as of last as_of_date lower than your specified date if latter does not exist
-# TODO - add fetch functions for all equities tables
-# TODO - create primary keys for tables hat don't have them
 # TODO - Add depository receipt security type - ADR 'Depository-Receipt' - S1735
 
 
@@ -117,9 +115,9 @@ def init_db():
             );
             
             -- Create indexes for faster querying
-            CREATE INDEX IF NOT EXISTS idx_equities_daily_price_history_ticker ON equities_daily_price_history(ticker);
-            CREATE INDEX IF NOT EXISTS idx_equities_daily_price_history_as_of_date ON equities_daily_price_history(as_of_date);
-            CREATE INDEX IF NOT EXISTS idx_equities_daily_price_history_created_at ON equities_daily_price_history(created_at);
+            CREATE INDEX IF NOT EXISTS idx_equities_daily_price_history_ticker ON equities_price_history(ticker);
+            CREATE INDEX IF NOT EXISTS idx_equities_daily_price_history_as_of_date ON equities_price_history(as_of_date);
+            CREATE INDEX IF NOT EXISTS idx_equities_daily_price_history_created_at ON equities_price_history(created_at);
 
             """)
             cur.execute("""
@@ -326,28 +324,99 @@ def process_security(security, as_of_date, latest_date='2024-07-31', db_bool=Tru
     return None
 
 
-def fetch_equity_classification(symbols, as_of_date):
-    symbols_tuple = tuple(symbols) if isinstance(symbols, list) else (symbols,)
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT * FROM daily_industry_sector_classification
-                WHERE symbol = %s AND as_of_date = %s
+def fetch_equity_data(table_name: str, symbol: str, as_of_date: Union[ str, datetime, None ] = None,
+                      start_date: Union[ str, datetime, None ] = None,
+                      end_date: Union[ str, datetime, None ] = None) -> Union[ Dict, List[ Dict ] ]:
+    """
+    Fetch equity data for a given symbol, table, and date range.
+
+    :param table_name: The name of the table to fetch data from
+    :param symbol: The ticker symbol of the equity
+    :param as_of_date: The date for which to fetch data. Can be 'latest', a string in 'YYYY-MM-DD' format, or None (which defaults to 'latest')
+    :param start_date: The start date for price history and total return index queries
+    :param end_date: The end date for price history and total return index queries
+    :return: A dictionary or list of dictionaries containing the equity data
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        # Validate table name to prevent SQL injection
+        valid_tables = [
+            'equities_dividend_yield', 'equities_industry_sector_classification',
+            'equities_market_capitalization', 'equities_daily_price_history',
+            'equities_total_return_index'
+        ]
+        if table_name not in valid_tables:
+            return {"error": f"Invalid table name: {table_name}"}
+
+        # Convert dates to datetime objects if they're strings
+        if isinstance(as_of_date, str) and as_of_date.lower() != 'latest':
+            as_of_date = datetime.strptime(as_of_date, '%Y-%m-%d').date()
+        if isinstance(start_date, str):
+            start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        if isinstance(end_date, str):
+            end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+
+        # Define queries for each table
+        if table_name in [ 'equities_dividend_yield', 'equities_industry_sector_classification',
+                           'equities_market_capitalization' ]:
+            if as_of_date is None or as_of_date == 'latest':
+                query = f"""
+                SELECT * FROM {table_name}
+                WHERE symbol = %s
                 ORDER BY as_of_date DESC
-            """, (symbols_tuple, as_of_date))
-            return cur.fetchone()
+                LIMIT 1
+                """
+                cursor.execute(query, (symbol,))
+            else:
+                query = f"""
+                SELECT * FROM {table_name}
+                WHERE symbol = %s AND as_of_date <= %s
+                ORDER BY as_of_date DESC
+                LIMIT 1
+                """
+                cursor.execute(query, (symbol, as_of_date))
 
+        elif table_name in [ 'equities_daily_price_history', 'equities_total_return_index' ]:
+            if not start_date or not end_date:
+                return {
+                    "error": "Both start_date and end_date are required for price history and total return index queries"}
 
-def fetch_equity_performance(symbols, start_date, end_date, as_of_date):
-    symbols_tuple = tuple(symbols) if isinstance(symbols, list) else (symbols,)
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT * FROM daily_total_return_index
-                WHERE symbol IN %s AND date BETWEEN %s AND %s AND as_of_date = %s
-                ORDER BY symbol, date
-            """, (symbols_tuple, start_date, end_date, as_of_date))
-            return cur.fetchall()
+            # Check if the date range exceeds 30 days
+            if (end_date - start_date).days > 30:
+                return {"error": "Date range cannot exceed 30 days"}
+
+            if as_of_date is None or as_of_date == 'latest':
+                query = f"""
+                SELECT * FROM {table_name}
+                WHERE symbol = %s AND date BETWEEN %s AND %s
+                ORDER BY as_of_date DESC, date
+                """
+                cursor.execute(query, (symbol, start_date, end_date))
+            else:
+                query = f"""
+                SELECT * FROM {table_name}
+                WHERE symbol = %s AND date BETWEEN %s AND %s AND as_of_date <= %s
+                ORDER BY as_of_date DESC, date
+                """
+                cursor.execute(query, (symbol, start_date, end_date, as_of_date))
+
+        result = cursor.fetchall()
+
+        if not result:
+            return {"error": f"No data found for symbol {symbol} in table {table_name}"}
+
+        if table_name in [ 'equities_daily_price_history', 'equities_total_return_index' ]:
+            return [ dict(row) for row in result ]
+        else:
+            return dict(result[ 0 ])
+
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def main(eq_perf_bool, eq_ind_bool, eq_yield_bool, eq_price_hist_bool, mcap_bool, num_workers, as_of_date, start_date,
