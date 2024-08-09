@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from morningstar_equity_data import add_to_db, get_connection
+import csv
+import time
 
 load_dotenv()
 
@@ -20,11 +22,9 @@ ftp_pass = os.getenv('MSTAR_FTP_PASSWORD')
 common_cols = [ 'MStarID', 'Ticker', 'FundName', 'PortfolioDate' ]
 
 """
-# TODO - Add total return info for ETFs, MFs and Funds
+# TODO - Modify fetch_fund_data to fetch total return info for funds
 # LATER - Add function to read raw files from ftp and save in S3
 # LATER - Create a droplet in digital ocean to parse the files and save in postgres tables
-# LATER - Receive reminder when you have to buy back the primary security
-# LATER - Marketing - What's a good way to set creatives for a loss harvesting product?
 """
 yields_and_expenses_cols = [ 'NetExpenseRatio', 'SECYield', 'SECYieldDate',
                              'CategoryName', 'CategoryNetExpenseRatio', 'Yield1Yr', 'Yield1YrDate' ]
@@ -238,6 +238,80 @@ def characteristics_processing(df, as_of_date, sec_type, characteristic_type, ta
         processed_df = processed_df.rename(columns=renamed_col_names)
 
         add_to_db(processed_df, table_name)
+
+
+def performance_processing(filename: str, as_of_date: str, sec_type: str, table_name: str):
+    """
+    Process a large CSV file of total return index data and persist it in the database.
+
+    :param filename: Path to the CSV file
+    :param as_of_date: The as-of date for the data
+    :param sec_type: The security type (OEF, CEF, ETF, MMF)
+    :param table_name: The name of the table to insert data into
+    """
+    chunk_size = 50000  # Adjust this based on your system's memory capacity
+    total_rows = sum(1 for _ in open(filename, 'r')) - 1  # Count total rows, subtract 1 for header
+    processed_rows = 0
+    start_time = time.time()
+
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        with open(filename, 'r') as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader)  # Skip header row
+
+            chunk = [ ]
+            for row in reader:
+                mstar_id, fund_name, date, value, _ = row
+                chunk.append((date, float(value), fund_name, mstar_id, as_of_date, sec_type))
+
+                if len(chunk) == chunk_size:
+                    insert_chunk(cursor, chunk, table_name)
+                    processed_rows += len(chunk)
+                    chunk = [ ]
+
+                    # Print progress and time estimate
+                    progress = processed_rows / total_rows
+                    elapsed_time = time.time() - start_time
+                    estimated_total_time = elapsed_time / progress if progress > 0 else 0
+                    remaining_time = estimated_total_time - elapsed_time
+
+                    print(f"Progress: {progress:.2%} | "
+                          f"Estimated time remaining: {remaining_time / 60:.2f} minutes")
+
+            # Insert any remaining rows
+            if chunk:
+                insert_chunk(cursor, chunk, table_name)
+                processed_rows += len(chunk)
+
+        conn.commit()
+        print(f"Completed processing {processed_rows} rows in {(time.time() - start_time) / 60:.2f} minutes")
+
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        conn.rollback()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def insert_chunk(cursor, chunk, table_name):
+    """
+    Insert a chunk of data into the database.
+    """
+    insert_query = f"""
+    INSERT INTO {table_name} (date, value, fund_name, mstar_id, as_of_date, security_type)
+    VALUES (%s, %s, %s, %s, %s, %s)
+    ON CONFLICT (mstar_id, date, as_of_date) DO UPDATE
+    SET value = EXCLUDED.value, fund_name = EXCLUDED.fund_name, security_type = EXCLUDED.security_type
+    """
+    cursor.executemany(insert_query, chunk)
+
+
+fn = '/Users/gokul/Documents/Personal/Prosper/prosper_app/src/datas/data_08_05_2024/raw/performance/OE_MF_Perfomance20240805_gramanathan.csv'
+performance_processing(filename=fn, as_of_date='2024-08-05', sec_type='OEF', table_name='funds_total_return_index')
 
 # etf_char_df = pd.read_csv(
 #     '/Users/gokul/Documents/Personal/Prosper/prosper_app/src/datas/data_08_07_2024/raw/characteristics/etf_universe_characteristics20240807_gramanathan.csv')
