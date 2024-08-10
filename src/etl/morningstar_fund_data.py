@@ -22,7 +22,6 @@ ftp_pass = os.getenv('MSTAR_FTP_PASSWORD')
 common_cols = [ 'MStarID', 'Ticker', 'FundName', 'PortfolioDate' ]
 
 """
-# TODO - Modify fetch_fund_data to fetch total return info for funds
 # LATER - Add function to read raw files from ftp and save in S3
 # LATER - Create a droplet in digital ocean to parse the files and save in postgres tables
 """
@@ -73,13 +72,16 @@ us_non_us_breakdown_cols = [ 'NonUSBondLong', 'NonUSBondNet', 'NonUSBondShort',
 us_non_us_net_cols = [ 'NonUSBondNet', 'NonUSStockNet', 'USBondNet', 'USStockNet' ]
 
 
-def fetch_fund_data(ticker: str, table_name: str, as_of_date: Union[ str, datetime, None ] = None) -> Dict:
+def fetch_fund_data(mstar_id: str, table_name: str, start_date: Union[ str, datetime ],
+                    end_date: Union[ str, datetime ], as_of_date: Union[ str, datetime, None ] = None) -> Dict:
     """
-    Fetch fund data for a given ticker, table, and date.
+    Fetch fund data for a given Morningstar ID, date range, and as_of_date.
 
-    :param ticker: The ticker symbol of the fund
+    :param mstar_id: The Morningstar ID of the fund
     :param table_name: The name of the table to fetch data from
-    :param as_of_date: The date for which to fetch data. Can be 'latest', a string in 'YYYY-MM-DD' format, or None (which defaults to 'latest')
+    :param start_date: The start date of the data range
+    :param end_date: The end date of the data range
+    :param as_of_date: The as-of date for the data. Can be 'latest', a string in 'YYYY-MM-DD' format, or None (which defaults to 'latest')
     :return: A dictionary containing the fund data
     """
     conn = get_connection()
@@ -90,37 +92,78 @@ def fetch_fund_data(ticker: str, table_name: str, as_of_date: Union[ str, dateti
         valid_tables = [
             'funds_asset_allocation', 'funds_bond_sector', 'funds_categories',
             'funds_market_price_and_capitalization', 'funds_stock_sector',
-            'funds_super_sector', 'funds_us_non_us', 'funds_yields_and_expenses'
+            'funds_super_sector', 'funds_us_non_us', 'funds_yields_and_expenses',
+            'funds_total_return_index'
         ]
         if table_name not in valid_tables:
             return {"error": f"Invalid table name: {table_name}"}
 
-        if as_of_date is None or as_of_date == 'latest':
-            query = f"""
-            SELECT * FROM {table_name}
-            WHERE ticker = %s
-            ORDER BY as_of_date DESC
-            LIMIT 1
-            """
-            cursor.execute(query, (ticker,))
+        # Convert dates to datetime objects if they're strings
+        if isinstance(start_date, str):
+            start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        if isinstance(end_date, str):
+            end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+
+        if table_name == 'funds_total_return_index':
+            if as_of_date is None or as_of_date == 'latest':
+                query = """
+                WITH latest_as_of_date AS (
+                    SELECT MAX(as_of_date) as max_date
+                    FROM funds_total_return_index
+                    WHERE mstar_id = %s AND as_of_date <= CURRENT_DATE
+                )
+                SELECT * FROM funds_total_return_index
+                WHERE mstar_id = %s
+                  AND date BETWEEN %s AND %s
+                  AND as_of_date = (SELECT max_date FROM latest_as_of_date)
+                ORDER BY date
+                """
+                cursor.execute(query, (mstar_id, mstar_id, start_date, end_date))
+            else:
+                if isinstance(as_of_date, str):
+                    as_of_date = datetime.strptime(as_of_date, '%Y-%m-%d').date()
+
+                query = """
+                WITH latest_as_of_date AS (
+                    SELECT MAX(as_of_date) as max_date
+                    FROM funds_total_return_index
+                    WHERE mstar_id = %s AND as_of_date <= %s
+                )
+                SELECT * FROM funds_total_return_index
+                WHERE mstar_id = %s
+                  AND date BETWEEN %s AND %s
+                  AND as_of_date = (SELECT max_date FROM latest_as_of_date)
+                ORDER BY date
+                """
+                cursor.execute(query, (mstar_id, as_of_date, mstar_id, start_date, end_date))
         else:
-            if isinstance(as_of_date, str):
-                as_of_date = datetime.strptime(as_of_date, '%Y-%m-%d').date()
+            # Existing logic for other tables
+            if as_of_date is None or as_of_date == 'latest':
+                query = f"""
+                SELECT * FROM {table_name}
+                WHERE mstar_id = %s
+                ORDER BY as_of_date DESC
+                LIMIT 1
+                """
+                cursor.execute(query, (mstar_id,))
+            else:
+                if isinstance(as_of_date, str):
+                    as_of_date = datetime.strptime(as_of_date, '%Y-%m-%d').date()
 
-            query = f"""
-            SELECT * FROM {table_name}
-            WHERE ticker = %s AND as_of_date <= %s
-            ORDER BY as_of_date DESC
-            LIMIT 1
-            """
-            cursor.execute(query, (ticker, as_of_date))
+                query = f"""
+                SELECT * FROM {table_name}
+                WHERE mstar_id = %s AND as_of_date <= %s
+                ORDER BY as_of_date DESC
+                LIMIT 1
+                """
+                cursor.execute(query, (mstar_id, as_of_date))
 
-        result = cursor.fetchone()
+        result = cursor.fetchall()
 
-        if result is None:
-            return {"error": f"No data found for ticker {ticker} in table {table_name}"}
+        if not result:
+            return {"error": f"No data found for Morningstar ID {mstar_id} in table {table_name}"}
 
-        return dict(result)
+        return [ dict(row) for row in result ]
 
     except Exception as e:
         return {"error": str(e)}
