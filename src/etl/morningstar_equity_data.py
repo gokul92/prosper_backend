@@ -157,7 +157,7 @@ def get_symbol_guide():
     symbol_guide_url = f"http://mshxml.morningstar.com/symbolGuide?username={mstar_symbol_guide_username}&password={mstar_symbol_guide_password}&exchange=126&security=1&JSONShort"
     response = requests.get(symbol_guide_url)
     df = pd.DataFrame(response.json()[ 'quotes' ][ 'results' ])
-    return df[ [ 'H1', 'S12', 'S19', 'S1735', 'S1736', 'S3059' ] ].to_dict(orient='records')
+    return df[ [ 'H1', 'S12', 'S19', 'S1735', 'S1736', 'S3059', 'S1012' ] ].to_dict(orient='records')
 
 
 def get_market_price_history(security, start_date, end_date, as_of_date):
