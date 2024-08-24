@@ -1,11 +1,11 @@
 import os
 import re
-from typing import Dict, Union
+from typing import List, Dict, Union
 from datetime import datetime
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from morningstar_equity_data import add_to_db, get_connection
+from .db_utils import add_to_db, get_connection
 import csv
 import time
 
@@ -72,8 +72,85 @@ us_non_us_breakdown_cols = [ 'NonUSBondLong', 'NonUSBondNet', 'NonUSBondShort',
 us_non_us_net_cols = [ 'NonUSBondNet', 'NonUSStockNet', 'USBondNet', 'USStockNet' ]
 
 
+def fetch_similar_funds(mstar_id: str) -> List[ Dict ]:
+    """
+    Fetch funds similar to the mstar_id passed in.
+
+    :param mstar_id: The ticker mstar_id of the fund
+    :return: A list of dictionaries containing information about similar funds
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        # Step 1: Retrieve the category of the mstar_id
+        category_query = """
+        WITH latest_category AS (
+            SELECT mstar_id, ticker, MAX(as_of_date) as latest_date
+            FROM funds_categories
+            WHERE mstar_id = %s
+            GROUP BY mstar_id
+        )
+        SELECT fc.category_name, fc.security_type
+        FROM funds_categories fc
+        JOIN latest_category lc ON fc.mstar_id = lc.mstar_id AND fc.as_of_date = lc.latest_date
+        WHERE fc.mstar_id = %s
+        """
+        cursor.execute(category_query, (mstar_id, mstar_id))
+        category_result = cursor.fetchone()
+
+        if not category_result:
+            return [ ]  # Return empty list if the mstar_id's category is not found
+
+        category_name, security_type = category_result[ 'category_name' ], category_result[ 'security_type' ]
+
+        # Step 2 & 3: Retrieve list of ETFs in that category excluding the mstar_id
+        similar_funds_query = """
+        WITH latest_category AS (
+            SELECT mstar_id, ticker, MAX(as_of_date) as latest_date
+            FROM funds_categories
+            GROUP BY mstar_id
+        ), latest_market_cap AS (
+            SELECT mstar_id, ticker, MAX(as_of_date) as latest_date
+            FROM funds_market_price_and_capitalization
+            GROUP BY mstar_id
+        )
+        SELECT fc.ticker, fc.mstar_id, fc.fund_name, mc.market_capitalization
+        FROM funds_categories fc
+        JOIN latest_category lc ON fc.mstar_id = lc.mstar_id AND fc.as_of_date = lc.latest_date
+        JOIN funds_market_price_and_capitalization mc ON fc.mstar_id = mc.mstar_id
+        JOIN latest_market_cap lmc ON mc.mstar_id = lmc.mstar_id AND mc.as_of_date = lmc.latest_date
+        WHERE fc.category_name = %s AND fc.security_type = 'ETF' AND fc.mstar_id != %s
+        ORDER BY mc.market_capitalization DESC
+        LIMIT 2
+        """
+        cursor.execute(similar_funds_query, (category_name, mstar_id))
+        similar_funds = cursor.fetchall()
+
+        # Step 4 & 5: Format and return the results
+        result = [ ]
+        for fund in similar_funds:
+            result.append({
+                'mstar_id': fund[ 'mstar_id' ],
+                'symbol': fund[ 'ticker' ],
+                'fund_name': fund[ 'fund_name' ],
+                'market_cap': fund[ 'market_capitalization' ],
+                'category_name': category_name
+            })
+
+        return result  # This will be an empty list if no similar funds are found
+
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        return [ ]
+    finally:
+        cursor.close()
+        conn.close()
+
+
 def fetch_fund_data(mstar_id: str, table_name: str, start_date: Union[ str, datetime ],
-                    end_date: Union[ str, datetime ], as_of_date: Union[ str, datetime, None ] = None) -> Dict:
+                    end_date: Union[ str, datetime ], as_of_date: Union[ str, datetime, None ] = None) -> Dict | List[
+    Dict ]:
     """
     Fetch fund data for a given Morningstar ID, date range, and as_of_date.
 
@@ -104,38 +181,46 @@ def fetch_fund_data(mstar_id: str, table_name: str, start_date: Union[ str, date
         if isinstance(end_date, str):
             end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
 
-        if table_name == 'funds_total_return_index':
+        if table_name in 'funds_total_return_index':
             if as_of_date is None or as_of_date == 'latest':
-                query = """
-                WITH latest_as_of_date AS (
-                    SELECT MAX(as_of_date) as max_date
-                    FROM funds_total_return_index
-                    WHERE mstar_id = %s AND as_of_date <= CURRENT_DATE
-                )
-                SELECT * FROM funds_total_return_index
-                WHERE mstar_id = %s
-                  AND date BETWEEN %s AND %s
-                  AND as_of_date = (SELECT max_date FROM latest_as_of_date)
-                ORDER BY date
-                """
-                cursor.execute(query, (mstar_id, mstar_id, start_date, end_date))
+                as_of_date_query = "MAX(as_of_date)"
             else:
                 if isinstance(as_of_date, str):
                     as_of_date = datetime.strptime(as_of_date, '%Y-%m-%d').date()
+                as_of_date_query = f"MAX(CASE WHEN as_of_date <= '{as_of_date}' THEN as_of_date END)"
 
-                query = """
-                WITH latest_as_of_date AS (
-                    SELECT MAX(as_of_date) as max_date
-                    FROM funds_total_return_index
-                    WHERE mstar_id = %s AND as_of_date <= %s
-                )
-                SELECT * FROM funds_total_return_index
-                WHERE mstar_id = %s
-                  AND date BETWEEN %s AND %s
-                  AND as_of_date = (SELECT max_date FROM latest_as_of_date)
-                ORDER BY date
-                """
-                cursor.execute(query, (mstar_id, as_of_date, mstar_id, start_date, end_date))
+            if start_date is None:
+                query = f"""
+                        WITH latest_as_of_date AS (
+                            SELECT {as_of_date_query} as max_date
+                            FROM {table_name}
+                            WHERE mstar_id = %s
+                        )
+                        SELECT * FROM {table_name}
+                        WHERE mstar_id = %s
+                          AND date <= %s
+                          AND as_of_date = (SELECT max_date FROM latest_as_of_date)
+                        ORDER BY date
+                        """
+                cursor.execute(query, (mstar_id, mstar_id, end_date))
+            else:
+                query = f"""
+                        WITH latest_as_of_date AS (
+                            SELECT {as_of_date_query} as max_date
+                            FROM {table_name}
+                            WHERE mstar_id = %s
+                        ), earliest_date AS (
+                            SELECT MIN(date) as min_date
+                            FROM {table_name}
+                            WHERE mstar_id = %s AND as_of_date = (SELECT max_date FROM latest_as_of_date)
+                        )
+                        SELECT * FROM {table_name}
+                        WHERE mstar_id = %s
+                          AND date BETWEEN GREATEST(%s, (SELECT min_date FROM earliest_date)) AND %s
+                          AND as_of_date = (SELECT max_date FROM latest_as_of_date)
+                        ORDER BY date
+                        """
+                cursor.execute(query, (mstar_id, mstar_id, mstar_id, start_date, end_date))
         else:
             # Existing logic for other tables
             if as_of_date is None or as_of_date == 'latest':
@@ -353,8 +438,8 @@ def insert_chunk(cursor, chunk, table_name):
     cursor.executemany(insert_query, chunk)
 
 
-fn = '/Users/gokul/Documents/Personal/Prosper/prosper_app/src/datas/data_08_05_2024/raw/performance/OE_MF_Perfomance20240805_gramanathan.csv'
-performance_processing(filename=fn, as_of_date='2024-08-05', sec_type='OEF', table_name='funds_total_return_index')
+# fn = '/Users/gokul/Documents/Personal/Prosper/prosper_app/src/datas/data_08_05_2024/raw/performance/OE_MF_Perfomance20240805_gramanathan.csv'
+# performance_processing(filename=fn, as_of_date='2024-08-05', sec_type='OEF', table_name='funds_total_return_index')
 
 # etf_char_df = pd.read_csv(
 #     '/Users/gokul/Documents/Personal/Prosper/prosper_app/src/datas/data_08_07_2024/raw/characteristics/etf_universe_characteristics20240807_gramanathan.csv')
