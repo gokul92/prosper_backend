@@ -1,8 +1,9 @@
 import pandas as pd
+from typing import Union, Dict
+from morningstar_equity_data import add_to_db, get_symbol_guide, get_connection
 
-from morningstar_equity_data import add_to_db, get_symbol_guide
 
-
+# TODO - modify security_master for equities to filter appropriate securities from the symbol_guide for equities
 def add_to_security_master(as_of_date, source_fn, sec_type):
     sec_master_table = 'security_master'
     if sec_type == 'Equity':
@@ -30,6 +31,39 @@ def add_to_security_master(as_of_date, source_fn, sec_type):
     else:
         return False
 
+
+def check_security_master(symbol: str) -> Union[ Dict, bool ]:
+    """
+    Check if a security is present in the security_master table.
+
+    :param symbol: The symbol of the security to check
+    :return: A dictionary containing the security information if found, False otherwise
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        query = """
+        SELECT *
+        FROM security_master
+        WHERE symbol = %s
+        ORDER BY as_of_date DESC
+        LIMIT 1
+        """
+        cursor.execute(query, (symbol,))
+        result = cursor.fetchone()
+
+        if result:
+            return dict(result)
+        else:
+            return False
+
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        return False
+    finally:
+        cursor.close()
+        conn.close()
 
 # source_dir = '/Users/gokul/Dropbox/Mac/Documents/Personal/Prosper/prosper_app/src/datas/data_08_10_2024/raw/characteristics/'
 
