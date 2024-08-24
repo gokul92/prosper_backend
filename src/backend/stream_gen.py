@@ -16,16 +16,9 @@ from db_operations import (
     create_thread, update_session_last_active, update_thread_last_active,
 )
 
-"""
-TODO -
-1. Format assistant instruction as a JSON response and parse JSON to display in UI
-2. Relatively high latency. Introduce a spinner/waiting/processing icon. Additionally, minimize latency
-3. Ask AI to provide 3 top follow-up questions.
-4. visual/gui workflow.
-5. Enhance UI to improve UX.
-6. 5 free messages, then sign up to use product.
-7. UI reboot
-"""
+# LATER - Receive reminder when you have to buy back the primary security
+# LATER - Marketing - What's a good way to build creatives for a loss harvesting product?
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
