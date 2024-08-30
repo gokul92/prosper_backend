@@ -3,7 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt
 from jose.exceptions import JWTError
 from pydantic import BaseModel, UUID4, validator
-from typing import Dict
+from typing import Dict, List
 import requests
 import os
 import psycopg
@@ -12,6 +12,11 @@ from datetime import date
 from uuid import uuid4
 from psycopg import errors as psycopg_errors
 import logging
+from urllib.parse import urlparse
+import uvicorn
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from psycopg.rows import dict_row
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +24,18 @@ load_dotenv()
 
 app = FastAPI()
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # Add your frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
 # Auth0 configuration
-AUTH0_DOMAIN = os.get_env("AUTH0_DOMAIN")
-API_AUDIENCE = os.get_env("API_AUDIENCE")
+AUTH0_DOMAIN = urlparse(os.getenv("AUTH0_DOMAIN")).netloc
+API_AUDIENCE = os.getenv("API_AUDIENCE")
 ALGORITHMS = ["RS256"]
 
 # JWT token bearer
@@ -54,19 +68,13 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Security(token_
     payload = verify_token(token)
     return payload.get("sub")  # Return the user ID from the token
 
-# Example protected endpoint
-@app.post("/api/financial-advice")
-async def get_financial_advice(user_data: Dict, current_user: str = Depends(get_current_user)):
-    # Process the user data and generate financial advice
-    # You can use the current_user ID to fetch user-specific data from your database if needed
-    return {"advice": "Your personalized financial advice here"}
-
-# Add more endpoints as needed, using the Depends(get_current_user) for authentication
-
 # Error handler for authentication errors
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
-    return {"detail": exc.detail}, exc.status_code
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
 
 # Pydantic model for account creation request
 class AccountCreate(BaseModel):
@@ -131,43 +139,89 @@ async def create_account(account: AccountCreate, current_user: str = Depends(get
 
 # New endpoint for adding account holdings
 class AccountHolding(BaseModel):
-    account_id: UUID4
     symbol: str
     quantity: float
     adjusted_cost_basis: float
     as_of_date: date = None
 
+    @validator('quantity')
+    def quantity_must_be_positive(cls, v):
+        if v <= 0:
+            raise ValueError('Quantity must be greater than 0')
+        return v
+
+class AccountHoldingsCreate(BaseModel):
+    account_id: UUID4
+    holdings: List[AccountHolding]
+
 @app.post("/add-account-holdings")
-async def add_account_holdings(holding: AccountHolding, current_user: str = Depends(get_current_user), conn: psycopg.Connection = Depends(get_db_connection)):
+async def add_account_holdings(holdings_data: AccountHoldingsCreate, current_user: str = Depends(get_current_user), conn: psycopg.Connection = Depends(get_db_connection)):
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             # Check if the account exists and belongs to the current user
-            cur.execute("SELECT 1 FROM accounts WHERE account_id = %s AND user_id = %s", (holding.account_id, current_user))
+            cur.execute("SELECT 1 FROM accounts WHERE account_id = %s AND user_id = %s", (holdings_data.account_id, current_user))
             if cur.fetchone() is None:
                 raise HTTPException(status_code=404, detail="Account not found or doesn't belong to the current user")
 
-            # Insert the holding
+            # Validate symbols against security_master
+            symbols = [holding.symbol for holding in holdings_data.holdings]
             cur.execute("""
+                SELECT DISTINCT ON (symbol)
+                    symbol,
+                    security_type,
+                    security_name
+                FROM security_master
+                WHERE symbol = ANY(%s)
+                ORDER BY symbol, CASE 
+                    WHEN security_type != 'Equity' THEN 0
+                    ELSE 1
+                END, as_of_date DESC
+            """, (symbols,))
+            validated_symbols = cur.fetchall()
+
+            unknown_symbols = [symbol for symbol in symbols if symbol not in [vs['symbol'] for vs in validated_symbols]]
+
+            if unknown_symbols:
+                raise HTTPException(status_code=400, detail=f"Unknown symbols: {', '.join(unknown_symbols)}")
+
+            # Prepare the query for inserting multiple holdings
+            insert_query = """
                 INSERT INTO account_holdings 
                 (account_id, symbol, quantity, adjusted_cost_basis, as_of_date)
                 VALUES (%s, %s, %s, %s, COALESCE(%s, CURRENT_DATE))
-            """, (
-                holding.account_id,
-                holding.symbol,
-                holding.quantity,
-                holding.adjusted_cost_basis,
-                holding.as_of_date
-            ))
+            """
+            
+            # Prepare the data for bulk insert
+            insert_data = [
+                (holdings_data.account_id, holding.symbol, holding.quantity, holding.adjusted_cost_basis, holding.as_of_date)
+                for holding in holdings_data.holdings
+            ]
+
+            # Execute the bulk insert
+            cur.executemany(insert_query, insert_data)
+
         conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
     except psycopg_errors.ForeignKeyViolation:
+        conn.rollback()
         raise HTTPException(status_code=400, detail="Invalid account ID")
-    except psycopg_errors.CheckViolation:
-        raise HTTPException(status_code=400, detail="Quantity must be greater than 0")
+    except psycopg_errors.CheckViolation as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=f"Constraint violation: {str(e)}")
+    except psycopg_errors.UniqueViolation:
+        conn.rollback()
+        raise HTTPException(status_code=409, detail="Duplicate entry for account holdings")
     except psycopg_errors.NotNullViolation:
+        conn.rollback()
         raise HTTPException(status_code=400, detail="Missing required fields")
     except psycopg.Error as e:
         conn.rollback()
-        logger.error(f"Database error while adding account holding: {str(e)}")
+        logger.error(f"Database error while adding account holdings: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-    return {"status": "success", "message": "Account holding added successfully"}
+    return {"status": "success", "message": f"Added {len(holdings_data.holdings)} holdings to the account"}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
