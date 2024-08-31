@@ -2,13 +2,13 @@ from fastapi import FastAPI, Depends, HTTPException, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt
 from jose.exceptions import JWTError
-from pydantic import BaseModel, UUID4, validator, Field
+from pydantic import BaseModel, UUID4, validator, Field, EmailStr
 from typing import Dict, List
 import requests
 import os
 import psycopg
 from dotenv import load_dotenv
-from datetime import date
+from datetime import date, datetime
 from uuid import uuid4
 from psycopg import errors as psycopg_errors
 import logging
@@ -17,8 +17,8 @@ import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg.rows import dict_row
-from src.domain_logic.tax_rates_calc import IncomeTaxRates
-from src.utils.validators import validate_payload
+from src.domain_logic import IncomeTaxRates
+from src.utils import validate_payload
 
 logger = logging.getLogger(__name__)
 
@@ -379,6 +379,58 @@ async def calculate_tax_rates(
         logger.error(f"Database error while processing tax rates: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+
+# Pydantic model for user creation request
+class UserCreate(BaseModel):
+    user_id: str
+    email_id: EmailStr
+    name: str = None
+    nickname: str = None
+    picture: str = None
+    email_verified: bool = False
+    user_created_at: datetime = None
+
+@app.post("/add-user")
+async def add_user(
+    user: UserCreate,
+    conn: psycopg.Connection = Depends(get_db_connection),
+):
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users (user_id, email_id, name, nickname, picture, email_verified, user_created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    user.user_id,
+                    user.email_id,
+                    user.name,
+                    user.nickname,
+                    user.picture,
+                    user.email_verified,
+                    user.user_created_at or datetime.utcnow(),
+                ),
+            )
+        conn.commit()
+    except psycopg_errors.UniqueViolation:
+        conn.rollback()
+        raise HTTPException(
+            status_code=409, detail="User with this ID or email already exists"
+        )
+    except psycopg_errors.NotNullViolation:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail="Missing required fields")
+    except psycopg.Error as e:
+        conn.rollback()
+        logger.error(f"Database error while adding user: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    return {
+        "status": "success",
+        "message": "User added successfully",
+        "user_id": user.user_id
+    }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
