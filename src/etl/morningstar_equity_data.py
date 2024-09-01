@@ -20,6 +20,7 @@ from tqdm import tqdm
 import itertools
 from itertools import combinations
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 
 load_dotenv()
 
@@ -125,9 +126,9 @@ def init_db():
             );
             
             -- Create indexes for faster querying
-            CREATE INDEX IF NOT EXISTS idx_equities_daily_price_history_ticker ON equities_price_history(ticker);
-            CREATE INDEX IF NOT EXISTS idx_equities_daily_price_history_as_of_date ON equities_price_history(as_of_date);
-            CREATE INDEX IF NOT EXISTS idx_equities_daily_price_history_created_at ON equities_price_history(created_at);
+            CREATE INDEX IF NOT EXISTS idx_equities_daily_price_history_ticker ON equities_daily_price_history(ticker);
+            CREATE INDEX IF NOT EXISTS idx_equities_daily_price_history_as_of_date ON equities_daily_price_history(as_of_date);
+            CREATE INDEX IF NOT EXISTS idx_equities_daily_price_history_created_at ON equities_daily_price_history(created_at);
 
             """)
             cur.execute("""
@@ -148,6 +149,17 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_equities_market_cap_symbol ON equities_market_capitalization(symbol);
             CREATE INDEX IF NOT EXISTS idx_equities_market_cap_date ON equities_market_capitalization(date);
             CREATE INDEX IF NOT EXISTS idx_equities_market_cap_as_of_date ON equities_market_capitalization(as_of_date);
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS historical_return_statistics (
+                    symbol TEXT NOT NULL UNIQUE REFERENCES security_master(symbol),
+                    security_type TEXT NOT NULL CHECK (security_type IN ('ETF', 'Equity', 'CEF', 'MMF', 'OEF')),
+                    annualized_return DOUBLE PRECISION,
+                    annualized_volatility DOUBLE PRECISION,
+                    as_of_date DATE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (symbol, security_type, as_of_date)
+                )
             """)
             conn.commit()
 
@@ -456,22 +468,54 @@ def fetch_equity_symbols(as_of_date):
             return [ row[ 'symbol' ] for row in cur.fetchall() ]
 
 
-def fetch_return_data(symbols, as_of_date):
+def fetch_return_data(symbols, as_of_date, longest=False):
     end_date = pd.to_datetime(as_of_date)
-    start_date = end_date - pd.Timedelta(days=365)
-
+    
     with get_connection() as conn:
         with conn.cursor() as cur:
-            query = """
-            SELECT symbol, date, value
-            FROM equities_total_return_index
-            WHERE symbol = ANY(%s)
-              AND as_of_date = %s
-              AND date BETWEEN %s AND %s
-            ORDER BY symbol, date DESC
-            """
-            cur.execute(query, [ symbols, as_of_date, start_date, end_date ])
-            df = pd.DataFrame(cur.fetchall())
+            if longest:
+                query = """
+                WITH latest_as_of_date AS (
+                    SELECT MAX(as_of_date) as max_date
+                    FROM equities_total_return_index
+                    WHERE symbol = ANY(%s)
+                      AND as_of_date <= %s
+                )
+                SELECT symbol, date, value
+                FROM equities_total_return_index
+                WHERE symbol = ANY(%s)
+                  AND as_of_date = (SELECT max_date FROM latest_as_of_date)
+                  AND date <= %s
+                ORDER BY symbol, date DESC
+                """
+                cur.execute(query, [symbols, as_of_date, symbols, end_date])
+            else:
+                start_date = end_date - pd.Timedelta(days=365)
+                query = """
+                WITH latest_as_of_date AS (
+                    SELECT MAX(as_of_date) as max_date
+                    FROM equities_total_return_index
+                    WHERE symbol = ANY(%s)
+                      AND as_of_date <= %s
+                )
+                SELECT symbol, date, value
+                FROM equities_total_return_index
+                WHERE symbol = ANY(%s)
+                  AND as_of_date = (SELECT max_date FROM latest_as_of_date)
+                  AND date BETWEEN %s AND %s
+                ORDER BY symbol, date DESC
+                """
+                cur.execute(query, [symbols, as_of_date, symbols, start_date, end_date])
+            
+            df = pd.DataFrame(cur.fetchall(), columns=['symbol', 'date', 'value'])
+    
+    if df.empty:
+        print(f"No return data found for the given symbols up to {as_of_date}")
+    else:
+        actual_as_of_date = df['date'].max().strftime('%Y-%m-%d')
+        if actual_as_of_date != as_of_date:
+            print(f"Using return data as of {actual_as_of_date} (requested: {as_of_date})")
+
     return df
 
 
@@ -481,11 +525,12 @@ def process_return_data(df):
     market_days = nyse.valid_days(start_date=df[ 'date' ].min(), end_date=df[ 'date' ].max())
     market_days = [ mkt_date.date() for mkt_date in market_days ]
     df = df.loc[ df[ 'date' ].isin(market_days) & df[ 'value' ] != 0.0 ].sort_values(by=[ 'symbol', 'date' ],
-                                                                                     ascending=[ True, False ])
+                                                                                     ascending=[ True, True ]) #date sorting should be ascending for returns to be correct.
 
     # Investigate why returns are null when value is never NULL
-    # 1 reason - pct_change() introduces NAs in the first value in each time series
-    # Calculate percentage returns
+    # reason is because security master classifies some symbols as Equity and ETF/CEF and we fetch returns for latter type which are Null
+    # Short term fix - if security master classifies symbol as Equity and ETF/CEF then exclude from processing
+    # Long term fix - fix security master classification so one security has only one security type
     df[ 'return' ] = df.groupby('symbol')[ 'value' ].pct_change()
     df.dropna(subset='return', inplace=True)
 
@@ -546,6 +591,7 @@ def insert_correlations_batch(batch, conn, cur):
 
 
 def calculate_equity_correlations(as_of_date):
+    # TODO - recalculate correlations based on fixed bug in process_return_data function
     symbols = fetch_equity_symbols("2024-08-10")  # change later
     returns_data = fetch_return_data(symbols, as_of_date)
     processed_data = process_return_data(returns_data)
@@ -608,7 +654,108 @@ def calculate_equity_correlations(as_of_date):
     print(f"Insertion completed. Total inserted: {inserted}/{total_correlations}")
 
 
-def main(eq_perf_bool, eq_ind_bool, eq_yield_bool, eq_price_hist_bool, mcap_bool, corr_bool, num_workers, as_of_date,
+def calculate_symbol_statistics_vectorized(symbols, processed_data, as_of_date):
+    symbol_data = processed_data[processed_data['symbol'].isin(symbols)].sort_values(['symbol', 'date'], ascending=[True, False])
+
+    # Find the date of the first non-zero return for each symbol
+    first_non_zero_date = symbol_data.groupby('symbol').apply(lambda x: x.loc[x['return'].ne(0) & (x['return'].notna()), 'date'].min())
+    
+    # Create a boolean mask for valid returns (including and after the first non-zero return date)
+    valid_returns_mask = symbol_data.apply(lambda row: row['date'] >= first_non_zero_date.get(row['symbol'], row['date']), axis=1)
+    
+    # Apply the mask to get valid returns
+    valid_returns = symbol_data.loc[valid_returns_mask]
+    
+    # Group by symbol for calculations
+    grouped = valid_returns.groupby('symbol')
+    
+    # Calculate trading days
+    trading_days = grouped['return'].size()
+    
+    # Calculate total return
+    total_return = (1 + valid_returns['return']).groupby(valid_returns['symbol']).prod() - 1
+    
+    # Initialize annualized return and volatility series with NaN
+    annualized_return = pd.Series(np.nan, index=trading_days.index)
+    annualized_volatility = pd.Series(np.nan, index=trading_days.index)
+    
+    # Calculate annualized return and volatility only for symbols with more than 30 trading days
+    mask = trading_days > 30
+    annualized_return[mask] = (1 + total_return[mask]) ** (252 / trading_days[mask]) - 1
+    annualized_volatility[mask] = grouped['return'].std()[mask] * np.sqrt(252)
+    
+    # Combine results
+    results = pd.DataFrame({
+        'symbol': trading_days.index,
+        'security_type': 'Equity',
+        'annualized_return': annualized_return,
+        'annualized_volatility': annualized_volatility,
+        'as_of_date': as_of_date,
+        'trading_days': trading_days
+    }).reset_index(drop=True)
+    
+    print(f"Processed {len(results)} symbols")
+    
+    return results
+
+def calculate_annualized_statistics(as_of_date, num_workers):
+    # Fetch equity symbols
+    symbols = fetch_equity_symbols(as_of_date)
+    
+    # Fetch return data for all symbols
+    returns_data = fetch_return_data(symbols, as_of_date, longest=True)
+    
+    # Process return data
+    processed_data = process_return_data(returns_data)
+    
+    # Split symbols into chunks for parallel processing
+    chunk_size = len(symbols) // num_workers + 1
+    symbol_chunks = [symbols[i:i + chunk_size] for i in range(0, len(symbols), chunk_size)]
+    
+    # Use parallel processing to calculate statistics for each chunk of symbols
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        partial_func = partial(calculate_symbol_statistics_vectorized, processed_data=processed_data, as_of_date=as_of_date)
+        futures = [executor.submit(partial_func, chunk) for chunk in symbol_chunks]
+        
+        results = []
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(symbol_chunks), desc="Calculating statistics"):
+            results.append(future.result())
+    
+    # Combine results from all chunks
+    results_df = pd.concat(results, ignore_index=True)
+    
+    # Insert data in the historical_return_statistics table
+    insert_historical_return_statistics(results_df)
+    
+    print(f"Calculated and inserted annualized statistics for {len(results_df)} equity securities.")
+
+def insert_historical_return_statistics(results_df):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for _, row in results_df.iterrows():
+                cur.execute("""
+                    INSERT INTO historical_return_statistics 
+                    (symbol, security_type, annualized_return, annualized_volatility, as_of_date, num_trading_days)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (symbol, security_type, as_of_date) 
+                    DO UPDATE SET 
+                        annualized_return = EXCLUDED.annualized_return,
+                        annualized_volatility = EXCLUDED.annualized_volatility,
+                        num_trading_days = EXCLUDED.num_trading_days,
+                        created_at = CURRENT_TIMESTAMP
+                """, (
+                    row['symbol'],
+                    row['security_type'],
+                    row['annualized_return'],
+                    row['annualized_volatility'],
+                    row['as_of_date'],
+                    row['trading_days']
+                ))
+            conn.commit()
+    
+    print(f"Inserted annualized statistics for {len(results_df)} equity securities.")
+
+def main(eq_perf_bool, eq_ind_bool, eq_yield_bool, eq_price_hist_bool, mcap_bool, corr_bool, eq_stats_bool, num_workers, as_of_date,
          start_date, end_date):
     # TODO - Fix init_db and check where symbol guide needs to be called
     # TODO - replace calls to symbol_guide_mstar with calls to the database security master
@@ -686,23 +833,24 @@ def main(eq_perf_bool, eq_ind_bool, eq_yield_bool, eq_price_hist_bool, mcap_bool
     if corr_bool:
         calculate_equity_correlations(as_of_date)
 
+    if eq_stats_bool:
+        start_time_annualized_stats = time.time()
+        calculate_annualized_statistics(as_of_date, num_workers)
+        end_time_annualized_stats = time.time()
+        duration = end_time_annualized_stats - start_time_annualized_stats
+        log_to_csv('Annualized Statistics', duration)
+        logging.info(f"Annualized statistics calculation completed in {duration:.2f} seconds")
+
 
 if __name__ == "__main__":
-    opts, args = getopt.getopt(sys.argv[ 1: ], "piyhmcfs:w:d:e:a:",
-                               [ "performance", "industry", "yield", "history", "mcap", "corr", "workers=", "date=",
-                                 "end_date=", "days=" ])
-    perf = False
-    industry = False
-    yld = False
-    history = False
-    mcap = False
-    corr = False
-    fetch = False
+    opts, args = getopt.getopt(sys.argv[1:], "piyhmcfts:w:d:e:a:",
+                               ["performance", "industry", "yield", "history", "mcap", "corr", "fetch", "stats", 
+                                "symbol=", "workers=", "date=", "end_date=", "days="])
+    perf = industry = yld = history = mcap = corr = fetch = stats = False
     symbol = None
     n_workers = 25
     as_of_date = date.today().strftime('%Y-%m-%d')
-    start_date = None
-    end_date = None
+    start_date = end_date = None
     num_days = None
 
     for opt, arg in opts:
@@ -720,10 +868,12 @@ if __name__ == "__main__":
             corr = True
         elif opt in ("-f", "--fetch"):
             fetch = True
-        elif opt in ("-w", "--workers"):
-            n_workers = int(arg)
+        elif opt in ("-t", "--stats"):
+            stats = True
         elif opt in ("-s", "--symbol"):
             symbol = arg
+        elif opt in ("-w", "--workers"):
+            n_workers = int(arg)
         elif opt in ("-d", "--date"):
             as_of_date = arg
         elif opt in ("-e", "--end_date"):
@@ -734,4 +884,4 @@ if __name__ == "__main__":
                 end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
                 start_date = (end_date_obj - timedelta(days=num_days)).strftime("%Y-%m-%d")
 
-    main(perf, industry, yld, history, mcap, corr, n_workers, as_of_date, start_date, end_date)
+    main(perf, industry, yld, history, mcap, corr, stats, n_workers, as_of_date, start_date, end_date)
