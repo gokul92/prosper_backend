@@ -1,2 +1,31 @@
 /.env
 /src/backend/openai_exploration.ipynb
+data/experiments/cost_basis/data/accounts_sorted_by_unreal_gl_pct.csv
+data/experiments/cost_basis/data/SL_filtered_by_valid_taxable_accounts_with_no_errors.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_3AA36901.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_3AA38004.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_3AA39402.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_3AA40209.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_3AA43580.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10001173.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10001420.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10001834.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10003210.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10003903.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10011920.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10014486.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10015140.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10015490.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10016017.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10017311.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10018698.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10022711.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10026222.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10028056.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10033350.csv
+data/experiments/cost_basis/data/unrealized_cost_basis/acc_10053571 .csv
+data/experiments/cost_basis/tax_optimizer.ipynb
+data/account_statements/Schwab statement.pdf
+data/reformat_state_income_tax_rates_file.ipynb
+src/backend/.ipynb_checkpoints/temp_testing-checkpoint.ipynb
+data/testing_jupyter_notebook.ipynb
