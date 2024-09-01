@@ -29,3 +29,6 @@ data/account_statements/Schwab statement.pdf
 data/reformat_state_income_tax_rates_file.ipynb
 src/backend/.ipynb_checkpoints/temp_testing-checkpoint.ipynb
 data/testing_jupyter_notebook.ipynb
+__pycache__
+/.idea
+*.DS_Store
