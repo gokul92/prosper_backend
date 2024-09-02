@@ -22,7 +22,7 @@ def get_connection():
     return psycopg.connect(f'host={db_host} port={db_port} dbname={db_name} user={db_user} password={db_pass}',
                            row_factory=dict_row)
 
-def fetch_symbol_types(symbols: List[str], as_of_date: str) -> Dict[str, str]:
+def fetch_symbol_types(symbols: List[str], as_of_date: str) -> Dict[str, Dict[str, str]]:
     query = """
     WITH latest_as_of_date AS (
         SELECT symbol, MAX(as_of_date) as as_of_date
@@ -30,7 +30,7 @@ def fetch_symbol_types(symbols: List[str], as_of_date: str) -> Dict[str, str]:
         WHERE symbol = ANY(%s) AND as_of_date <= %s
         GROUP BY symbol
     )
-    SELECT sm.symbol, sm.security_type
+    SELECT sm.symbol, sm.security_type, sm.mstar_id
     FROM security_master sm
     JOIN latest_as_of_date lad
     ON sm.symbol = lad.symbol AND sm.as_of_date = lad.as_of_date
@@ -44,24 +44,24 @@ def fetch_symbol_types(symbols: List[str], as_of_date: str) -> Dict[str, str]:
     for row in rows:
         symbol = row['symbol']
         security_type = row['security_type']
-        if symbol in symbol_types:
-            if security_type != 'Equity':
-                symbol_types[symbol] = security_type
-        else:
-            symbol_types[symbol] = security_type
+        mstar_id = row.get('mstar_id')
+        symbol_types[symbol] = {'security_type': security_type, 'mstar_id': mstar_id}
     
     return symbol_types
 
-def fetch_total_return_indices(symbols: List[str], symbol_types: Dict[str, str], as_of_date: str) -> Dict[str, pd.DataFrame]:
+def fetch_total_return_indices(symbols: List[str], symbol_types: Dict[str, Dict[str, str]], as_of_date: str) -> Dict[str, pd.DataFrame]:
     total_return_indices = {}
     nyse = mcal.get_calendar('NYSE')
     
     for symbol in symbols:
-        symbol_type = symbol_types.get(symbol)
-        if not symbol_type:
+        symbol_info = symbol_types.get(symbol)
+        if not symbol_info:
             continue
         
-        if symbol_type == 'Equity':
+        security_type = symbol_info['security_type']
+        mstar_id = symbol_info.get('mstar_id')
+        
+        if security_type == 'Equity':
             query = """
             WITH latest_as_of_date AS (
                 SELECT MAX(as_of_date) as as_of_date
@@ -75,6 +75,7 @@ def fetch_total_return_indices(symbols: List[str], symbol_types: Dict[str, str],
               AND date <= %s
             ORDER BY date
             """
+            query_params = (symbol, as_of_date, symbol, as_of_date)
         else:
             query = """
             WITH latest_as_of_date AS (
@@ -89,14 +90,15 @@ def fetch_total_return_indices(symbols: List[str], symbol_types: Dict[str, str],
               AND date <= %s
             ORDER BY date
             """
+            query_params = (mstar_id, as_of_date, mstar_id, as_of_date)
         
         with get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(query, (symbol, as_of_date, symbol, as_of_date))
+                cur.execute(query, query_params)
                 result = cur.fetchall()
         
         if not result:
-            print(f"No data found for symbol: {symbol}")
+            print(f"No data found for symbol: {symbol} (Type: {security_type})")
             continue
         
         df = pd.DataFrame(result, columns=['date', 'value'])
@@ -145,3 +147,6 @@ def calculate_covariances(symbols: List[str], as_of_date: str) -> Dict[tuple, fl
         covariances[(symbol1, symbol2)] = covariance
     
     return covariances
+
+print(calculate_covariances(['AAPL', 'MSFT', 'AMZN', 'VOO', 'GLD'], '2024-08-10'))
+# TODO - Doesn't work for ETFs in the mix
