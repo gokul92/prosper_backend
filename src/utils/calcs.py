@@ -160,7 +160,7 @@ def process_return_data(total_return_indices: Dict[str, pd.DataFrame]) -> Dict[s
     
     return return_data
 
-def calculate_symbol_weights(holdings: List[Dict]) -> Dict[str, Dict[str, float]]:
+def calculate_symbol_weights(holdings: List[Dict]) -> Tuple[Dict[str, Dict[str, float]], float]:
     total_value = sum(holding['quantity'] * holding['price'] for holding in holdings)
     
     weights = {}
@@ -173,7 +173,7 @@ def calculate_symbol_weights(holdings: List[Dict]) -> Dict[str, Dict[str, float]
             'volatility': holding['annualized_volatility']
         }
     
-    return weights
+    return weights, total_value
 
 def calculate_portfolio_return(weights: Dict[str, Dict[str, float]]) -> float:
     return sum(data['weight'] * data['return'] for data in weights.values())
@@ -221,7 +221,7 @@ def portfolio_statistics(account_id: str, as_of_date: str) -> Dict[str, Union[fl
     holdings = fetch_account_data(account_id, as_of_date)
     
     # Calculate symbol weights and get individual returns and volatilities
-    weights = calculate_symbol_weights(holdings)
+    weights, account_balance = calculate_symbol_weights(holdings)
     
     # Calculate portfolio return
     portfolio_return = calculate_portfolio_return(weights)
@@ -250,7 +250,8 @@ def portfolio_statistics(account_id: str, as_of_date: str) -> Dict[str, Union[fl
         'return': portfolio_return,
         'volatility': portfolio_volatility,
         'weights': {symbol: data['weight'] for symbol, data in weights.items()},
-        'individual_stats': individual_stats
+        'individual_stats': individual_stats,
+        'account_balance': account_balance
     }
 
 # Example usage:
