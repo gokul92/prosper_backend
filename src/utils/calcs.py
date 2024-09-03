@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Union
 import psycopg
 from psycopg.rows import dict_row
 import os
@@ -216,7 +216,7 @@ def calculate_portfolio_volatility(weights: Dict[str, Dict[str, float]], covaria
     portfolio_variance = weight_array.T @ annualized_cov_matrix @ weight_array
     return np.sqrt(portfolio_variance)
 
-def portfolio_statistics(account_id: str, as_of_date: str) -> Dict[str, float]:
+def portfolio_statistics(account_id: str, as_of_date: str) -> Dict[str, Union[float, Dict]]:
     # Fetch all account data in one query
     holdings = fetch_account_data(account_id, as_of_date)
     
@@ -237,14 +237,24 @@ def portfolio_statistics(account_id: str, as_of_date: str) -> Dict[str, float]:
     # Calculate portfolio volatility
     portfolio_volatility = calculate_portfolio_volatility(weights, covariance_matrix)
     
+    # Extract individual security annualized returns and volatilities
+    individual_stats = {
+        holding['symbol']: {
+            'annualized_return': holding['annualized_return'],
+            'annualized_volatility': holding['annualized_volatility']
+        }
+        for holding in holdings
+    }
+    
     return {
         'return': portfolio_return,
         'volatility': portfolio_volatility,
-        'weights': {symbol: data['weight'] for symbol, data in weights.items()}
+        'weights': {symbol: data['weight'] for symbol, data in weights.items()},
+        'individual_stats': individual_stats
     }
 
 # Example usage:
-stats = portfolio_statistics('f828a152-4a1d-4fbc-bf79-4ec0acdb2aca', '2024-08-31')
-print(f"Portfolio Return: {stats['return']:.4f}")
-print(f"Portfolio Volatility: {stats['volatility']:.4f}")
-print("Weights:", stats['weights'])
+# stats = portfolio_statistics('f828a152-4a1d-4fbc-bf79-4ec0acdb2aca', '2024-08-31')
+# print(f"Portfolio Return: {stats['return']:.4f}")
+# print(f"Portfolio Volatility: {stats['volatility']:.4f}")
+# print("Weights:", stats['weights'])
