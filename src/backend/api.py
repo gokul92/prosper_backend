@@ -1,9 +1,9 @@
-from fastapi import FastAPI, Depends, HTTPException, Security
+from fastapi import FastAPI, Depends, HTTPException, Security, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt
 from jose.exceptions import JWTError
 from pydantic import BaseModel, UUID4, validator, Field, EmailStr
-from typing import Dict, List
+from typing import Dict, List, Optional
 import requests
 import os
 import psycopg
@@ -19,6 +19,8 @@ from fastapi.responses import JSONResponse
 from psycopg.rows import dict_row
 from src.domain_logic import IncomeTaxRates
 from src.utils import validate_payload
+from src.domain_logic.simulation import simulate_balance_paths
+from src.utils.calcs import portfolio_statistics
 
 logger = logging.getLogger(__name__)
 
@@ -431,6 +433,120 @@ async def add_user(
         "message": "User added successfully",
         "user_id": user.user_id
     }
+
+async def fetch_account_statistics(
+    account_id: UUID4,
+    current_user: str,
+    conn: psycopg.Connection
+) -> dict:
+    try:
+        # Check if the account belongs to the current user
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT 1 FROM accounts WHERE account_id = %s AND user_id = %s",
+                (account_id, current_user)
+            )
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Account not found or doesn't belong to the current user"
+                )
+
+            # Fetch account holdings
+            cur.execute(
+                """
+                SELECT symbol, quantity, adjusted_cost_basis
+                FROM account_holdings
+                WHERE account_id = %s
+                """,
+                (account_id,)
+            )
+            holdings = cur.fetchall()
+
+        if not holdings:
+            raise HTTPException(
+                status_code=404,
+                detail="No holdings found for this account"
+            )
+
+        # Calculate portfolio statistics
+        stats = portfolio_statistics(holdings)
+
+        return {
+            "account_id": account_id,
+            "balance": stats["total_value"],
+            "annual_mean_return": stats["annual_return"],
+            "annual_std_dev": stats["annual_volatility"],
+            "sharpe_ratio": stats["sharpe_ratio"],
+            "asset_allocation": stats["asset_allocation"]
+        }
+
+    except psycopg.Error as e:
+        logger.error(f"Database error while fetching account statistics: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    except Exception as e:
+        logger.error(f"Error while calculating account statistics: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error calculating account statistics")
+
+@app.get("/account-statistics/{account_id}")
+async def get_account_statistics(
+    account_id: UUID4,
+    current_user: str = Depends(get_current_user),
+    conn: psycopg.Connection = Depends(get_db_connection)
+):
+    return await fetch_account_statistics(account_id, current_user, conn)
+
+@app.get("/monte-carlo-simulation")
+async def monte_carlo_simulation(
+    account_id: str,
+    percentiles: Optional[List[float]] = Query(default=[25, 50, 75], description="List of percentiles to calculate"),
+    current_user: str = Depends(get_current_user),
+    conn: psycopg.Connection = Depends(get_db_connection)
+):
+    try:
+        # Validate percentiles
+        if not all(0 <= p <= 100 for p in percentiles):
+            raise HTTPException(status_code=400, detail="Percentiles must be between 0 and 100")
+
+        # Fetch account details
+        account_stats = await fetch_account_statistics(account_id, current_user, conn)
+
+        # Simulate balance paths
+        start_date = date.today().isoformat()
+        simulation_result = simulate_balance_paths(
+            starting_balance=account_stats["account_balance"],
+            annual_mean=account_stats["return"],
+            annual_std_dev=account_stats["volatility"],
+            start_date=start_date,
+            lower_percentile=min(percentiles),
+            upper_percentile=max(percentiles)
+        )
+
+        # Extract paths for requested percentiles
+        percentile_paths = {
+            f"percentile_{p}": simulation_result["balance_paths"].quantile(p/100, axis=1).to_dict()
+            for p in percentiles
+        }
+
+        # Prepare response
+        response = {
+            "account_id": account_id,
+            "account_info": account_stats,
+            "simulation_start_date": start_date,
+            "percentile_paths": percentile_paths,
+            "final_balance_min": float(simulation_result["final_balance_min"]),
+            "final_balance_max": float(simulation_result["final_balance_max"]),
+            "final_mean_balance": float(simulation_result["final_mean_balance"]),
+        }
+
+        return response
+
+    except psycopg.Error as e:
+        logger.error(f"Database error during Monte Carlo simulation: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    except Exception as e:
+        logger.error(f"Error during Monte Carlo simulation: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error during simulation")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
