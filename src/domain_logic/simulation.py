@@ -1,8 +1,7 @@
 import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
-from typing import Optional, Tuple
-from datetime import datetime, timedelta
+from typing import Tuple
 
 def generate_paths(annual_mean: float, annual_std_dev: float, start_date: str, n_steps: int = 252, n_paths: int = 10000) -> pd.DataFrame:
     """
@@ -97,32 +96,54 @@ def simulate_balance_paths(starting_balance: float, annual_mean: float, annual_s
     lower_balance_path = starting_balance * (1 + lower_path)
     upper_balance_path = starting_balance * (1 + upper_path)
 
+    # Convert index to datetime for resampling
+    balance_paths.index = pd.to_datetime(balance_paths.index)
+    mean_balance_path.index = pd.to_datetime(mean_balance_path.index)
+    lower_balance_path.index = pd.to_datetime(lower_balance_path.index)
+    upper_balance_path.index = pd.to_datetime(upper_balance_path.index)
+
+    # Resample to monthly frequency
+    balance_paths_monthly = balance_paths.resample('ME').last()
+    mean_balance_path_monthly = mean_balance_path.resample('ME').last()
+    lower_balance_path_monthly = lower_balance_path.resample('ME').last()
+    upper_balance_path_monthly = upper_balance_path.resample('ME').last()
+
+    # Convert to strings
+    balance_paths_monthly.index = balance_paths_monthly.index.strftime('%Y-%m-%d')
+    mean_balance_path_monthly.index = mean_balance_path_monthly.index.strftime('%Y-%m-%d')
+    lower_balance_path_monthly.index = lower_balance_path_monthly.index.strftime('%Y-%m-%d')
+    upper_balance_path_monthly.index = upper_balance_path_monthly.index.strftime('%Y-%m-%d')
+
+    # Extract dates from the index
+    dates = balance_paths_monthly.index.tolist()
+
     result = {
-        "balance_paths": balance_paths,
-        "mean_balance_path": mean_balance_path,
-        "lower_balance_path": lower_balance_path,
-        "upper_balance_path": upper_balance_path,
-        "final_balance_min": balance_paths.iloc[-1].min(),
-        "final_balance_max": balance_paths.iloc[-1].max(),
-        "final_mean_balance": mean_balance_path.iloc[-1],
-        "final_lower_balance": lower_balance_path.iloc[-1],
-        "final_upper_balance": upper_balance_path.iloc[-1],
+        "balance_paths": balance_paths_monthly,
+        "mean_balance_path": mean_balance_path_monthly,
+        "lower_balance_path": lower_balance_path_monthly,
+        "upper_balance_path": upper_balance_path_monthly,
+        "final_balance_min": balance_paths_monthly.iloc[-1].min(),
+        "final_balance_max": balance_paths_monthly.iloc[-1].max(),
+        "final_mean_balance": mean_balance_path_monthly.iloc[-1],
+        "final_lower_balance": lower_balance_path_monthly.iloc[-1],
+        "final_upper_balance": upper_balance_path_monthly.iloc[-1],
+        "dates": dates
     }
 
     return result
 
 # Example usage:
-starting_balance = 300000  # starting balance
-annual_mean = 0.19  # annual return
-annual_std_dev = 0.45  # annual standard deviation
-start_date = '2023-01-01'
+# starting_balance = 300000  # starting balance
+# annual_mean = 0.19  # annual return
+# annual_std_dev = 0.45  # annual standard deviation
+# start_date = '2023-01-01'
 
-result = simulate_balance_paths(starting_balance, annual_mean, annual_std_dev, start_date)
+# result = simulate_balance_paths(starting_balance, annual_mean, annual_std_dev, start_date)
 
-print(f"Starting balance: ${starting_balance:.2f}")
-print(f"Final balance range: ${result['final_balance_min']:.2f} to ${result['final_balance_max']:.2f}")
-print(f"Mean final balance: ${result['final_mean_balance']:.2f}")
-print(f"25th percentile final balance: ${result['final_lower_balance']:.2f}")
-print(f"75th percentile final balance: ${result['final_upper_balance']:.2f}")
-print(f"Shape of balance paths: {result['balance_paths'].shape}")
-print(f"Date range: {result['balance_paths'].index[0]} to {result['balance_paths'].index[-1]}")
+# print(f"Starting balance: ${starting_balance:.2f}")
+# print(f"Final balance range: ${result['final_balance_min']:.2f} to ${result['final_balance_max']:.2f}")
+# print(f"Mean final balance: ${result['final_mean_balance']:.2f}")
+# print(f"25th percentile final balance: ${result['final_lower_balance']:.2f}")
+# print(f"75th percentile final balance: ${result['final_upper_balance']:.2f}")
+# print(f"Shape of balance paths: {result['balance_paths'].shape}")
+# print(f"Date range: {result['balance_paths'].index[0]} to {result['balance_paths'].index[-1]}")

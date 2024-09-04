@@ -7,20 +7,25 @@ from typing import Dict, List, Optional
 import requests
 import os
 import psycopg
+from datetime import date
 from dotenv import load_dotenv
 from datetime import date, datetime
 from uuid import uuid4
 from psycopg import errors as psycopg_errors
 import logging
 from urllib.parse import urlparse
+from fastapi import Body
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg.rows import dict_row
-from src.domain_logic import IncomeTaxRates
-from src.utils import validate_payload
-from src.domain_logic.simulation import simulate_balance_paths
-from src.utils.calcs import portfolio_statistics
+from ..utils.validators import validate_payload
+from ..domain_logic.simulation import simulate_balance_paths
+from ..utils.calcs import portfolio_statistics
+from ..domain_logic.tax_rates_calc import IncomeTaxRates
+import json
+from pathlib import Path
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -452,33 +457,15 @@ async def fetch_account_statistics(
                     detail="Account not found or doesn't belong to the current user"
                 )
 
-            # Fetch account holdings
-            cur.execute(
-                """
-                SELECT symbol, quantity, adjusted_cost_basis
-                FROM account_holdings
-                WHERE account_id = %s
-                """,
-                (account_id,)
-            )
-            holdings = cur.fetchall()
-
-        if not holdings:
-            raise HTTPException(
-                status_code=404,
-                detail="No holdings found for this account"
-            )
-
+        as_of_date = date.today().isoformat()
         # Calculate portfolio statistics
-        stats = portfolio_statistics(holdings)
+        stats = portfolio_statistics(str(account_id), as_of_date)
 
         return {
-            "account_id": account_id,
-            "balance": stats["total_value"],
-            "annual_mean_return": stats["annual_return"],
-            "annual_std_dev": stats["annual_volatility"],
-            "sharpe_ratio": stats["sharpe_ratio"],
-            "asset_allocation": stats["asset_allocation"]
+            "account_id": str(account_id),
+            "account_balance": stats["account_balance"],
+            "annual_mean_return": stats["return"],
+            "annual_std_dev": stats["volatility"]
         }
 
     except psycopg.Error as e:
@@ -496,10 +483,11 @@ async def get_account_statistics(
 ):
     return await fetch_account_statistics(account_id, current_user, conn)
 
-@app.get("/monte-carlo-simulation")
+
+@app.post("/monte-carlo-simulation")
 async def monte_carlo_simulation(
-    account_id: str,
-    percentiles: Optional[List[float]] = Query(default=[25, 50, 75], description="List of percentiles to calculate"),
+    account_id: str = Body(...),
+    percentiles: Optional[List[float]] = Body(default=[25, 50, 75]),
     current_user: str = Depends(get_current_user),
     conn: psycopg.Connection = Depends(get_db_connection)
 ):
@@ -515,8 +503,8 @@ async def monte_carlo_simulation(
         start_date = date.today().isoformat()
         simulation_result = simulate_balance_paths(
             starting_balance=account_stats["account_balance"],
-            annual_mean=account_stats["return"],
-            annual_std_dev=account_stats["volatility"],
+            annual_mean=account_stats["annual_mean_return"],
+            annual_std_dev=account_stats["annual_std_dev"],
             start_date=start_date,
             lower_percentile=min(percentiles),
             upper_percentile=max(percentiles)
@@ -533,11 +521,34 @@ async def monte_carlo_simulation(
             "account_id": account_id,
             "account_info": account_stats,
             "simulation_start_date": start_date,
+            "dates": simulation_result["dates"],
             "percentile_paths": percentile_paths,
+            "mean_balance_path": simulation_result["mean_balance_path"].to_dict(),
+            "lower_balance_path": simulation_result["lower_balance_path"].to_dict(),
+            "upper_balance_path": simulation_result["upper_balance_path"].to_dict(),
             "final_balance_min": float(simulation_result["final_balance_min"]),
             "final_balance_max": float(simulation_result["final_balance_max"]),
             "final_mean_balance": float(simulation_result["final_mean_balance"]),
+            "final_lower_balance": float(simulation_result["final_lower_balance"]),
+            "final_upper_balance": float(simulation_result["final_upper_balance"]),
         }
+
+        # Debug: Write response to JSON file
+        # debug_dir = Path("/Users/gokul/Dropbox/Mac/Documents/Personal/Prosper/prosper_backend/data/temp_debug")
+        # debug_dir.mkdir(exist_ok=True)
+        # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # debug_file = debug_dir / f"monte_carlo_simulation_{timestamp}.json"
+        
+        # import pandas as pd
+        # def json_serial(obj):
+        #     if isinstance(obj, pd.Timestamp):
+        #         return obj.strftime('%Y-%m-%d')
+        #     raise TypeError(f"Type {type(obj)} not serializable")
+
+        # with open(debug_file, "w") as f:
+        #     json.dump(response, f, indent=2, default=json_serial)
+        
+        # logger.info(f"Debug output written to {debug_file}")
 
         return response
 
@@ -546,6 +557,8 @@ async def monte_carlo_simulation(
         raise HTTPException(status_code=500, detail="Internal server error")
     except Exception as e:
         logger.error(f"Error during Monte Carlo simulation: {str(e)}")
+        logger.error(f"Error type: {type(e)}")
+        logger.error(f"Error details: {e.args}")
         raise HTTPException(status_code=500, detail="Error during simulation")
 
 if __name__ == "__main__":
