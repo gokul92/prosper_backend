@@ -108,6 +108,13 @@ def simulate_balance_paths(starting_balance: float, annual_mean: float, annual_s
     lower_balance_path_monthly = lower_balance_path.resample('ME').last()
     upper_balance_path_monthly = upper_balance_path.resample('ME').last()
 
+    # Add start_date and starting_balance as the first data point to monthly objects
+    start_date_ts = pd.Timestamp(start_date)
+    balance_paths_monthly = pd.concat([pd.DataFrame({col: starting_balance for col in balance_paths_monthly.columns}, index=[start_date_ts]), balance_paths_monthly])
+    mean_balance_path_monthly = pd.concat([pd.Series({start_date_ts: starting_balance}), mean_balance_path_monthly])
+    lower_balance_path_monthly = pd.concat([pd.Series({start_date_ts: starting_balance}), lower_balance_path_monthly])
+    upper_balance_path_monthly = pd.concat([pd.Series({start_date_ts: starting_balance}), upper_balance_path_monthly])
+
     # Convert to strings
     balance_paths_monthly.index = balance_paths_monthly.index.strftime('%Y-%m-%d')
     mean_balance_path_monthly.index = mean_balance_path_monthly.index.strftime('%Y-%m-%d')
@@ -136,9 +143,11 @@ def simulate_balance_paths(starting_balance: float, annual_mean: float, annual_s
 # starting_balance = 300000  # starting balance
 # annual_mean = 0.19  # annual return
 # annual_std_dev = 0.45  # annual standard deviation
-# start_date = '2023-01-01'
+# start_date = '2024-08-31'
 
 # result = simulate_balance_paths(starting_balance, annual_mean, annual_std_dev, start_date)
+
+# print(result)
 
 # print(f"Starting balance: ${starting_balance:.2f}")
 # print(f"Final balance range: ${result['final_balance_min']:.2f} to ${result['final_balance_max']:.2f}")
