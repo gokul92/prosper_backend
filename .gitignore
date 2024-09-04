@@ -35,3 +35,4 @@ __pycache__
 src/etl/process_times.csv
 src/etl/equity_data_fetcher.log
 equity_data_fetcher.log
+data/temp_debug/monte_carlo_simulation_20240903_190357.json
