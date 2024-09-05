@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Security, Query
+from fastapi import FastAPI, Depends, HTTPException, Security, Query, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt
 from jose.exceptions import JWTError
@@ -26,12 +26,54 @@ from ..domain_logic.tax_rates_calc import IncomeTaxRates
 import json
 from pathlib import Path
 from datetime import datetime
+from functools import lru_cache
+import hashlib
+from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-app = FastAPI()
+# Define the lifespan context manager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup logic
+    logger.info("Starting up the application")
+    try:
+        # Create a new connection for this startup task
+        conn = psycopg.connect(
+            dbname=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USERNAME"),
+            password=os.getenv("DB_PASSWORD"),
+            host=os.getenv("DB_HOST"),
+            port=os.getenv("DB_PORT"),
+        )
+        
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS monte_carlo_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    result JSONB,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        conn.commit()
+        logger.info("monte_carlo_cache table created successfully")
+    except psycopg.Error as e:
+        logger.error(f"Error creating monte_carlo_cache table: {str(e)}")
+        raise
+    finally:
+        if conn:
+            conn.close()
+    
+    yield  # This is where the app runs
+    
+    # Shutdown logic
+    logger.info("Shutting down the application")
+    # Perform any cleanup tasks here if needed
+
+# Create the FastAPI app with the lifespan
+app = FastAPI(lifespan=lifespan)
 
 # Add CORS middleware
 app.add_middleware(
@@ -484,6 +526,16 @@ async def get_account_statistics(
     return await fetch_account_statistics(account_id, current_user, conn)
 
 
+# LRU cache for in-memory caching
+@lru_cache(maxsize=100)
+def get_cached_simulation(cache_key: str):
+    return None  # This will be updated if we find a cached result
+
+# Function to generate a cache key
+def generate_cache_key(account_id: str, percentiles: List[float], current_user: str):
+    key_data = f"{account_id}:{sorted(percentiles)}:{current_user}"
+    return hashlib.md5(key_data.encode()).hexdigest()
+
 @app.post("/monte-carlo-simulation")
 async def monte_carlo_simulation(
     account_id: str = Body(...),
@@ -492,10 +544,28 @@ async def monte_carlo_simulation(
     conn: psycopg.Connection = Depends(get_db_connection)
 ):
     try:
-        # Validate percentiles
-        if not all(0 <= p <= 100 for p in percentiles):
-            raise HTTPException(status_code=400, detail="Percentiles must be between 0 and 100")
+        # Generate cache key
+        cache_key = generate_cache_key(account_id, percentiles, current_user)
 
+        # Check in-memory cache
+        cached_result = get_cached_simulation(cache_key)
+        if cached_result:
+            return cached_result
+
+        # Check database cache
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT result FROM monte_carlo_cache WHERE cache_key = %s",
+                (cache_key,)
+            )
+            db_cached_result = cur.fetchone()
+            if db_cached_result:
+                # Update in-memory cache and return result
+                get_cached_simulation.cache_clear()
+                get_cached_simulation(cache_key)
+                return db_cached_result['result']
+
+        # If not cached, perform the simulation
         # Fetch account details
         account_stats = await fetch_account_statistics(account_id, current_user, conn)
 
@@ -533,22 +603,17 @@ async def monte_carlo_simulation(
             "final_upper_balance": float(simulation_result["final_upper_balance"]),
         }
 
-        # Debug: Write response to JSON file
-        # debug_dir = Path("/Users/gokul/Dropbox/Mac/Documents/Personal/Prosper/prosper_backend/data/temp_debug")
-        # debug_dir.mkdir(exist_ok=True)
-        # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # debug_file = debug_dir / f"monte_carlo_simulation_{timestamp}.json"
-        
-        # import pandas as pd
-        # def json_serial(obj):
-        #     if isinstance(obj, pd.Timestamp):
-        #         return obj.strftime('%Y-%m-%d')
-        #     raise TypeError(f"Type {type(obj)} not serializable")
+        # Cache the result
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO monte_carlo_cache (cache_key, result) VALUES (%s, %s) ON CONFLICT (cache_key) DO UPDATE SET result = EXCLUDED.result, created_at = CURRENT_TIMESTAMP",
+                (cache_key, json.dumps(response))
+            )
+        conn.commit()
 
-        # with open(debug_file, "w") as f:
-        #     json.dump(response, f, indent=2, default=json_serial)
-        
-        # logger.info(f"Debug output written to {debug_file}")
+        # Update in-memory cache
+        get_cached_simulation.cache_clear()
+        get_cached_simulation(cache_key)
 
         return response
 
@@ -560,6 +625,22 @@ async def monte_carlo_simulation(
         logger.error(f"Error type: {type(e)}")
         logger.error(f"Error details: {e.args}")
         raise HTTPException(status_code=500, detail="Error during simulation")
+
+# Add a new endpoint to clear the cache if needed
+@app.post("/clear-monte-carlo-cache")
+async def clear_monte_carlo_cache(
+    current_user: str = Depends(get_current_user),
+    conn: psycopg.Connection = Depends(get_db_connection)
+):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM monte_carlo_cache")
+        conn.commit()
+        get_cached_simulation.cache_clear()
+        return {"message": "Monte Carlo simulation cache cleared"}
+    except psycopg.Error as e:
+        logger.error(f"Database error while clearing Monte Carlo cache: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
