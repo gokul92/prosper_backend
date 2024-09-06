@@ -66,8 +66,7 @@ def get_percentile_paths(paths: pd.DataFrame, lower_percentile: float = 25, uppe
     return mean_path, lower_path, upper_path
 
 def simulate_balance_paths(starting_balance: float, annual_mean: float, annual_std_dev: float, 
-                           start_date: str, n_steps: int = 252, n_paths: int = 10000, 
-                           lower_percentile: float = 25, upper_percentile: float = 75) -> dict:
+                           start_date: str, n_steps: int = 252, n_paths: int = 10000) -> dict:
     """
     Simulate balance paths based on given parameters.
 
@@ -78,8 +77,6 @@ def simulate_balance_paths(starting_balance: float, annual_mean: float, annual_s
     start_date (str): Start date in 'YYYY-MM-DD' format
     n_steps (int): Number of steps (trading days) to simulate (default 252)
     n_paths (int): Number of paths to generate (default 10000)
-    lower_percentile (float): Lower percentile for path calculation (default 25)
-    upper_percentile (float): Upper percentile for path calculation (default 75)
 
     Returns:
     dict: A dictionary containing simulation results
@@ -87,53 +84,54 @@ def simulate_balance_paths(starting_balance: float, annual_mean: float, annual_s
     # Generate paths
     paths = generate_paths(annual_mean, annual_std_dev, start_date, n_steps, n_paths)
     
-    # Calculate percentile paths
-    mean_path, lower_path, upper_path = get_percentile_paths(paths, lower_percentile, upper_percentile)
-    
     # Apply to starting balance
     balance_paths = starting_balance * (1 + paths)
-    mean_balance_path = starting_balance * (1 + mean_path)
-    lower_balance_path = starting_balance * (1 + lower_path)
-    upper_balance_path = starting_balance * (1 + upper_path)
+
+    # Calculate 95th and 5th percentile paths
+    percentile_95_path = balance_paths.quantile(0.95, axis=1)
+    percentile_5_path = balance_paths.quantile(0.05, axis=1)
+
+    # Calculate probabilities
+    one_year_index = min(252, len(balance_paths) - 1)  # Ensure we don't go out of bounds
+    one_year_balances = balance_paths.iloc[one_year_index]
+    starting_balance_percentile = (one_year_balances < starting_balance).mean()
+    prob_95_percentile = 0.95 - starting_balance_percentile
+    prob_5_percentile = starting_balance_percentile - 0.05
 
     # Convert index to datetime for resampling
     balance_paths.index = pd.to_datetime(balance_paths.index)
-    mean_balance_path.index = pd.to_datetime(mean_balance_path.index)
-    lower_balance_path.index = pd.to_datetime(lower_balance_path.index)
-    upper_balance_path.index = pd.to_datetime(upper_balance_path.index)
+    percentile_95_path.index = pd.to_datetime(percentile_95_path.index)
+    percentile_5_path.index = pd.to_datetime(percentile_5_path.index)
 
     # Resample to monthly frequency
     balance_paths_monthly = balance_paths.resample('ME').last()
-    mean_balance_path_monthly = mean_balance_path.resample('ME').last()
-    lower_balance_path_monthly = lower_balance_path.resample('ME').last()
-    upper_balance_path_monthly = upper_balance_path.resample('ME').last()
+    percentile_95_path_monthly = percentile_95_path.resample('ME').last()
+    percentile_5_path_monthly = percentile_5_path.resample('ME').last()
 
     # Add start_date and starting_balance as the first data point to monthly objects
     start_date_ts = pd.Timestamp(start_date)
     balance_paths_monthly = pd.concat([pd.DataFrame({col: starting_balance for col in balance_paths_monthly.columns}, index=[start_date_ts]), balance_paths_monthly])
-    mean_balance_path_monthly = pd.concat([pd.Series({start_date_ts: starting_balance}), mean_balance_path_monthly])
-    lower_balance_path_monthly = pd.concat([pd.Series({start_date_ts: starting_balance}), lower_balance_path_monthly])
-    upper_balance_path_monthly = pd.concat([pd.Series({start_date_ts: starting_balance}), upper_balance_path_monthly])
+    percentile_95_path_monthly = pd.concat([pd.Series({start_date_ts: starting_balance}), percentile_95_path_monthly])
+    percentile_5_path_monthly = pd.concat([pd.Series({start_date_ts: starting_balance}), percentile_5_path_monthly])
 
     # Convert to strings
     balance_paths_monthly.index = balance_paths_monthly.index.strftime('%Y-%m-%d')
-    mean_balance_path_monthly.index = mean_balance_path_monthly.index.strftime('%Y-%m-%d')
-    lower_balance_path_monthly.index = lower_balance_path_monthly.index.strftime('%Y-%m-%d')
-    upper_balance_path_monthly.index = upper_balance_path_monthly.index.strftime('%Y-%m-%d')
+    percentile_95_path_monthly.index = percentile_95_path_monthly.index.strftime('%Y-%m-%d')
+    percentile_5_path_monthly.index = percentile_5_path_monthly.index.strftime('%Y-%m-%d')
 
     # Extract dates from the index
     dates = balance_paths_monthly.index.tolist()
 
     result = {
         "balance_paths": balance_paths_monthly,
-        "mean_balance_path": mean_balance_path_monthly,
-        "lower_balance_path": lower_balance_path_monthly,
-        "upper_balance_path": upper_balance_path_monthly,
+        "percentile_95_balance_path": percentile_95_path_monthly,
+        "percentile_5_balance_path": percentile_5_path_monthly,
+        "prob_95_percentile": prob_95_percentile,
+        "prob_5_percentile": prob_5_percentile,
         "final_balance_min": balance_paths_monthly.iloc[-1].min(),
         "final_balance_max": balance_paths_monthly.iloc[-1].max(),
-        "final_mean_balance": mean_balance_path_monthly.iloc[-1],
-        "final_lower_balance": lower_balance_path_monthly.iloc[-1],
-        "final_upper_balance": upper_balance_path_monthly.iloc[-1],
+        "final_95_percentile_balance": percentile_95_path_monthly.iloc[-1],
+        "final_5_percentile_balance": percentile_5_path_monthly.iloc[-1],
         "dates": dates
     }
 
