@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Security, Query, Body
+from fastapi import FastAPI, Depends, HTTPException, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt
 from jose.exceptions import JWTError
@@ -29,6 +29,7 @@ from datetime import datetime
 from functools import lru_cache
 import hashlib
 from contextlib import asynccontextmanager
+from fastapi.exceptions import RequestValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -532,20 +533,27 @@ def get_cached_simulation(cache_key: str):
     return None  # This will be updated if we find a cached result
 
 # Function to generate a cache key
-def generate_cache_key(account_id: str, percentiles: List[float], current_user: str):
-    key_data = f"{account_id}:{sorted(percentiles)}:{current_user}"
+def generate_cache_key(account_id: str, current_user: str):
+    key_data = f"{account_id}:{current_user}"
     return hashlib.md5(key_data.encode()).hexdigest()
+
+from fastapi import HTTPException, Body
+from pydantic import BaseModel, UUID4
+
+class MonteCarloSimulationRequest(BaseModel):
+    account_id: UUID4
 
 @app.post("/monte-carlo-simulation")
 async def monte_carlo_simulation(
-    account_id: str = Body(...),
-    percentiles: Optional[List[float]] = Body(default=[25, 50, 75]),
+    request: MonteCarloSimulationRequest,
     current_user: str = Depends(get_current_user),
     conn: psycopg.Connection = Depends(get_db_connection)
 ):
     try:
+        account_id = str(request.account_id)
+        
         # Generate cache key
-        cache_key = generate_cache_key(account_id, percentiles, current_user)
+        cache_key = generate_cache_key(account_id, current_user)
 
         # Check in-memory cache
         cached_result = get_cached_simulation(cache_key)
@@ -575,16 +583,8 @@ async def monte_carlo_simulation(
             starting_balance=account_stats["account_balance"],
             annual_mean=account_stats["annual_mean_return"],
             annual_std_dev=account_stats["annual_std_dev"],
-            start_date=start_date,
-            lower_percentile=min(percentiles),
-            upper_percentile=max(percentiles)
+            start_date=start_date
         )
-
-        # Extract paths for requested percentiles
-        percentile_paths = {
-            f"percentile_{p}": simulation_result["balance_paths"].quantile(p/100, axis=1).to_dict()
-            for p in percentiles
-        }
 
         # Prepare response
         response = {
@@ -592,16 +592,28 @@ async def monte_carlo_simulation(
             "account_info": account_stats,
             "simulation_start_date": start_date,
             "dates": simulation_result["dates"],
-            "percentile_paths": percentile_paths,
-            "mean_balance_path": simulation_result["mean_balance_path"].to_dict(),
-            "lower_balance_path": simulation_result["lower_balance_path"].to_dict(),
-            "upper_balance_path": simulation_result["upper_balance_path"].to_dict(),
+            "balance_paths": simulation_result["balance_paths"].to_dict(),
+            "percentile_95_balance_path": simulation_result["percentile_95_balance_path"].to_dict(),
+            "percentile_5_balance_path": simulation_result["percentile_5_balance_path"].to_dict(),
+            "prob_95_percentile": float(simulation_result["prob_95_percentile"]),
+            "prob_5_percentile": float(simulation_result["prob_5_percentile"]),
             "final_balance_min": float(simulation_result["final_balance_min"]),
             "final_balance_max": float(simulation_result["final_balance_max"]),
-            "final_mean_balance": float(simulation_result["final_mean_balance"]),
-            "final_lower_balance": float(simulation_result["final_lower_balance"]),
-            "final_upper_balance": float(simulation_result["final_upper_balance"]),
+            "final_95_percentile_balance": float(simulation_result["final_95_percentile_balance"]),
+            "final_5_percentile_balance": float(simulation_result["final_5_percentile_balance"])
         }
+
+        # Write response to JSON file
+        data_dir = Path(__file__).parent.parent.parent / 'data' / 'temp_debug'
+        data_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_name = f"monte_carlo_simulation_{account_id}_{timestamp}.json"
+        file_path = data_dir / file_name
+
+        with open(file_path, 'w') as f:
+            json.dump(response, f, indent=2, default=str)
+
+        logger.info(f"Monte Carlo simulation result saved to {file_path}")
 
         # Cache the result
         with conn.cursor() as cur:
@@ -617,6 +629,9 @@ async def monte_carlo_simulation(
 
         return response
 
+    except RequestValidationError as e:
+        logger.error(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=422, detail=str(e))
     except psycopg.Error as e:
         logger.error(f"Database error during Monte Carlo simulation: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
