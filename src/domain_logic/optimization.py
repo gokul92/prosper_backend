@@ -84,7 +84,6 @@ class TaxOptimizer:
         grad = self.q_m * (self.s - self.c) * self.r
         print(f"Iteration {self.iteration}:")
         print(f"  Current solution: {xk}")
-        print(f"  Gradient: {grad}")
         print(f"  Objective value: {self.objective(xk)}")
 
     def optimize(self):
@@ -110,19 +109,19 @@ class TaxOptimizer:
         return result.x, result
 
 # Example usage
-delta = 100  # Total shares to sell
-s = 25       # Current share price
-c = np.array([5, 7.5, 50, 85])  # Cost basis for each lot
-r = np.array([0.20, 0.20, 0.35, 0.35])  # Tax rates (long-term, long-term, short-term, short-term)
-q_m = np.array([3000, 1570, 350, 50])  # Shares in each lot
-q = np.sum(q_m)     # Total shares available
+# delta = 100  # Total shares to sell
+# s = 25       # Current share price
+# c = np.array([5, 7.5, 50, 85])  # Cost basis for each lot
+# r = np.array([0.20, 0.20, 0.35, 0.35])  # Tax rates (long-term, long-term, short-term, short-term)
+# q_m = np.array([3000, 1570, 350, 50])  # Shares in each lot
+# q = np.sum(q_m)     # Total shares available
 
-optimizer = TaxOptimizer(delta, s, c, r, q, q_m)
-optimal_fractions, optimization_result = optimizer.optimize()
+# optimizer = TaxOptimizer(delta, s, c, r, q, q_m)
+# optimal_fractions, optimization_result = optimizer.optimize()
 
-print("Optimization successful:", optimization_result.success)
-print("Optimization message:", optimization_result.message)
-print("Optimal fractions to sell from each lot:", optimal_fractions)
-print("Total tax:", optimization_result.fun * delta * s)
-print("Shares sold from each lot:", optimal_fractions * q_m)
-print("Total shares sold:", np.sum(optimal_fractions * q_m))
+# print("Optimization successful:", optimization_result.success)
+# print("Optimization message:", optimization_result.message)
+# print("Optimal fractions to sell from each lot:", optimal_fractions)
+# print("Total tax:", optimization_result.fun * delta * s)
+# print("Shares sold from each lot:", optimal_fractions * q_m)
+# print("Total shares sold:", np.sum(optimal_fractions * q_m))
