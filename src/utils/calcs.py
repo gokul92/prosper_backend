@@ -413,7 +413,12 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
         'prob_5_percentile': original_simulation_result['prob_5_percentile'],
         'final_95_percentile_balance': original_simulation_result['final_95_percentile_balance'],
         'final_5_percentile_balance': original_simulation_result['final_5_percentile_balance'],
-        'dates': original_simulation_result['dates']
+        'dates': original_simulation_result['dates'],
+        'prob_greater_than_starting': original_simulation_result['prob_greater_than_starting'],
+        'prob_between_starting_and_95': original_simulation_result['prob_between_starting_and_95'],
+        'prob_between_5_and_starting': original_simulation_result['prob_between_5_and_starting'],
+        'percentile_95_balance_1y': original_simulation_result['percentile_95_balance_1y'],
+        'percentile_5_balance_1y': original_simulation_result['percentile_5_balance_1y']
     })
     
     for cash_target in range(5, 80, 5):
@@ -486,7 +491,12 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
             'prob_5_percentile': simulation_result['prob_5_percentile'],
             'final_95_percentile_balance': simulation_result['final_95_percentile_balance'],
             'final_5_percentile_balance': simulation_result['final_5_percentile_balance'],
-            'dates': simulation_result['dates']
+            'dates': simulation_result['dates'],
+            'prob_greater_than_starting': simulation_result['prob_greater_than_starting'],
+            'prob_between_starting_and_95': simulation_result['prob_between_starting_and_95'],
+            'prob_between_5_and_starting': simulation_result['prob_between_5_and_starting'],
+            'percentile_95_balance_1y': simulation_result['percentile_95_balance_1y'],
+            'percentile_5_balance_1y': simulation_result['percentile_5_balance_1y']
         }
     
     if 'return_data' in stats:
