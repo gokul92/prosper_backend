@@ -3,7 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt
 from jose.exceptions import JWTError
 from pydantic import BaseModel, UUID4, validator, Field, EmailStr
-from typing import Dict, List, Optional
+from typing import Dict, List
 import requests
 import os
 import psycopg
@@ -14,14 +14,13 @@ from uuid import uuid4
 from psycopg import errors as psycopg_errors
 import logging
 from urllib.parse import urlparse
-from fastapi import Body
+from fastapi.encoders import jsonable_encoder
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg.rows import dict_row
 from ..utils.validators import validate_payload
-from ..domain_logic.simulation import simulate_balance_paths
-from ..utils.calcs import portfolio_statistics
+from ..utils.calcs import portfolio_statistics, optimized_portfolio_stats
 from ..domain_logic.tax_rates_calc import IncomeTaxRates
 import json
 from contextlib import asynccontextmanager
@@ -31,6 +30,7 @@ from functools import lru_cache
 import hashlib
 from contextlib import asynccontextmanager
 from fastapi.exceptions import RequestValidationError
+from src.utils.json_utils import CustomJSONEncoder, process_for_json
 
 logger = logging.getLogger(__name__)
 
@@ -485,41 +485,23 @@ def add_user(user: UserCreate):
             "user_id": user.user_id
         }
 
-def fetch_account_statistics(
-    account_id: UUID4,
-    current_user: str,
-    conn: psycopg.Connection
-) -> dict:
-    try:
-        # Check if the account belongs to the current user
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM accounts WHERE account_id = %s AND user_id = %s",
-                (account_id, current_user)
-            )
-            if cur.fetchone() is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Account not found or doesn't belong to the current user"
-                )
+def validate_account_id(account_id: str, current_user: str, conn: psycopg.Connection) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM accounts WHERE account_id = %s AND user_id = %s",
+            (account_id, current_user)
+        )
+        return cur.fetchone() is not None
 
-        as_of_date = date.today().isoformat()
-        # Calculate portfolio statistics
-        stats = portfolio_statistics(str(account_id), as_of_date)
-
-        return {
-            "account_id": str(account_id),
-            "account_balance": stats["account_balance"],
-            "annual_mean_return": stats["return"],
-            "annual_std_dev": stats["volatility"]
-        }
-
-    except psycopg.Error as e:
-        logger.error(f"Database error while fetching account statistics: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-    except Exception as e:
-        logger.error(f"Error while calculating account statistics: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error calculating account statistics")
+def fetch_account_statistics(account_id: str, current_user: str, conn: psycopg.Connection) -> dict:
+    if not validate_account_id(account_id, current_user, conn):
+        raise HTTPException(
+            status_code=404,
+            detail="Account not found or doesn't belong to the current user"
+        )
+    
+    # Call portfolio_statistics from calcs.py
+    return portfolio_statistics(account_id, date.today().isoformat())
 
 @app.get("/account-statistics/{account_id}")
 def get_account_statistics(
@@ -536,8 +518,8 @@ def get_cached_simulation(cache_key: str):
     return None  # This will be updated if we find a cached result
 
 # Function to generate a cache key
-def generate_cache_key(account_id: str, current_user: str):
-    key_data = f"{account_id}:{current_user}"
+def generate_cache_key(account_id: str, current_user: str, as_of_date: str):
+    key_data = f"{account_id}:{current_user}:{as_of_date}"
     return hashlib.md5(key_data.encode()).hexdigest()
 
 from fastapi import HTTPException, Body
@@ -546,6 +528,7 @@ from pydantic import BaseModel, UUID4
 class MonteCarloSimulationRequest(BaseModel):
     account_id: UUID4
 
+
 @app.post("/monte-carlo-simulation")
 def monte_carlo_simulation(
     request: MonteCarloSimulationRequest,
@@ -553,16 +536,24 @@ def monte_carlo_simulation(
 ):
     try:
         account_id = str(request.account_id)
+        as_of_date = date.today().isoformat()  # Use today's date as as_of_date
         
-        # Generate cache key
-        cache_key = generate_cache_key(account_id, current_user)
-
-        # Check in-memory cache
-        cached_result = get_cached_simulation(cache_key)
-        if cached_result:
-            return cached_result
-
         with get_db_connection() as conn:
+            # Validate account ID
+            if not validate_account_id(account_id, current_user, conn):
+                raise HTTPException(
+                    status_code=404,
+                    detail="Account not found or doesn't belong to the current user"
+                )
+
+            # Generate cache key with as_of_date
+            cache_key = generate_cache_key(account_id, current_user, as_of_date)
+
+            # Check in-memory cache
+            cached_result = get_cached_simulation(cache_key)
+            if cached_result:
+                return JSONResponse(content=jsonable_encoder(cached_result))
+
             # Check database cache
             with conn.cursor() as cur:
                 cur.execute(
@@ -574,60 +565,38 @@ def monte_carlo_simulation(
                     # Update in-memory cache and return result
                     get_cached_simulation.cache_clear()
                     get_cached_simulation(cache_key)
-                    return db_cached_result['result']
+                    return JSONResponse(content=jsonable_encoder(db_cached_result['result']))
 
             # If not cached, perform the simulation
-            # Fetch account details
-            account_stats = fetch_account_statistics(account_id, current_user, conn)
-
-            # Simulate balance paths
-            start_date = date.today().isoformat()
-            simulation_result = simulate_balance_paths(
-                starting_balance=account_stats["account_balance"],
-                annual_mean=account_stats["annual_mean_return"],
-                annual_std_dev=account_stats["annual_std_dev"],
-                start_date=start_date
-            )
+            simulation_result = optimized_portfolio_stats(account_id, as_of_date)
 
             # Prepare response
-            response = {
+            result = {
                 "account_id": account_id,
-                "account_info": account_stats,
-                "simulation_start_date": start_date,
-                "dates": simulation_result["dates"],
-                "balance_paths": simulation_result["balance_paths"].to_dict(),
-                "percentile_95_balance_path": simulation_result["percentile_95_balance_path"].to_dict(),
-                "percentile_5_balance_path": simulation_result["percentile_5_balance_path"].to_dict(),
-                "prob_95_percentile": float(simulation_result["prob_95_percentile"]),
-                "prob_5_percentile": float(simulation_result["prob_5_percentile"]),
-                "final_balance_min": float(simulation_result["final_balance_min"]),
-                "final_balance_max": float(simulation_result["final_balance_max"]),
-                "final_95_percentile_balance": float(simulation_result["final_95_percentile_balance"]),
-                "final_5_percentile_balance": float(simulation_result["final_5_percentile_balance"]),
-                "prob_greater_than_starting": float(simulation_result["prob_greater_than_starting"]),
-                "prob_between_starting_and_95": float(simulation_result["prob_between_starting_and_95"]),
-                "prob_between_5_and_starting": float(simulation_result["prob_between_5_and_starting"]),
-                "percentile_95_balance_1y": float(simulation_result["percentile_95_balance_1y"]),
-                "percentile_5_balance_1y": float(simulation_result["percentile_5_balance_1y"])
+                "simulation_start_date": as_of_date,
+                "original_stats": simulation_result['original_stats'],
+                "optimized_portfolios": simulation_result['optimized_portfolios']
             }
 
+            processed_result = process_for_json(result)
+
             # Write response to JSON file
-            # data_dir = Path(__file__).parent.parent.parent / 'data' / 'temp_debug'
-            # data_dir.mkdir(exist_ok=True)
-            # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            # file_name = f"monte_carlo_simulation_{account_id}_{timestamp}.json"
-            # file_path = data_dir / file_name
+            data_dir = Path(__file__).parent.parent.parent / 'data' / 'temp_debug'
+            data_dir.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_name = f"monte_carlo_simulation_{account_id}_{timestamp}.json"
+            file_path = data_dir / file_name
 
-            # with open(file_path, 'w') as f:
-            #     json.dump(response, f, indent=2, default=str)
+            with open(file_path, 'w') as f:
+                json.dump(processed_result, f, cls=CustomJSONEncoder, indent=2)
 
-            # logger.info(f"Monte Carlo simulation result saved to {file_path}")
+            logger.info(f"Monte Carlo simulation result saved to {file_path}")
 
             # Cache the result
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO monte_carlo_cache (cache_key, result) VALUES (%s, %s) ON CONFLICT (cache_key) DO UPDATE SET result = EXCLUDED.result, created_at = CURRENT_TIMESTAMP",
-                    (cache_key, json.dumps(response))
+                    (cache_key, json.dumps(processed_result, cls=CustomJSONEncoder))
                 )
             conn.commit()
 
@@ -635,8 +604,12 @@ def monte_carlo_simulation(
             get_cached_simulation.cache_clear()
             get_cached_simulation(cache_key)
 
-            return response
+            # Use jsonable_encoder to prepare the response
+            json_compatible_result = jsonable_encoder(processed_result)
+            return JSONResponse(content=json_compatible_result)
 
+    except HTTPException:
+        raise
     except RequestValidationError as e:
         logger.error(f"Validation error: {str(e)}")
         raise HTTPException(status_code=422, detail=str(e))
