@@ -5,9 +5,16 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from .db_utils import add_to_db, get_connection
+from db_utils import add_to_db, get_connection
 import csv
 import time
+import pandas_market_calendars as mcal
+import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+from tqdm import tqdm
+from morningstar_equity_data import log_to_csv
+import logging
 
 load_dotenv()
 
@@ -147,19 +154,18 @@ def fetch_similar_funds(mstar_id: str) -> List[ Dict ]:
         cursor.close()
         conn.close()
 
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
-def fetch_fund_data(mstar_id: str, table_name: str, start_date: Union[ str, datetime ],
-                    end_date: Union[ str, datetime ], as_of_date: Union[ str, datetime, None ] = None) -> Dict | List[
-    Dict ]:
+def fetch_fund_data(mstar_ids: List[str], table_name: str, as_of_date: Union[str, datetime], start_date: Union[str, datetime, None] = None) -> List[Dict]:
     """
-    Fetch fund data for a given Morningstar ID, date range, and as_of_date.
+    Fetch fund data for given Morningstar IDs, date range, and as_of_date.
 
-    :param mstar_id: The Morningstar ID of the fund
+    :param mstar_ids: List of Morningstar IDs of the funds
     :param table_name: The name of the table to fetch data from
-    :param start_date: The start date of the data range
-    :param end_date: The end date of the data range
-    :param as_of_date: The as-of date for the data. Can be 'latest', a string in 'YYYY-MM-DD' format, or None (which defaults to 'latest')
-    :return: A dictionary containing the fund data
+    :param as_of_date: The as-of date for the data (equivalent to end_date)
+    :param start_date: The start date of the data range. If None, fetch longest history possible.
+    :return: A list of dictionaries containing the fund data
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -173,85 +179,78 @@ def fetch_fund_data(mstar_id: str, table_name: str, start_date: Union[ str, date
             'funds_total_return_index'
         ]
         if table_name not in valid_tables:
-            return {"error": f"Invalid table name: {table_name}"}
+            return [{"error": f"Invalid table name: {table_name}"}]
 
         # Convert dates to datetime objects if they're strings
+        if isinstance(as_of_date, str):
+            as_of_date = datetime.strptime(as_of_date, '%Y-%m-%d').date()
         if isinstance(start_date, str):
             start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
-        if isinstance(end_date, str):
-            end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
 
-        if table_name in 'funds_total_return_index':
-            if as_of_date is None or as_of_date == 'latest':
-                as_of_date_query = "MAX(as_of_date)"
-            else:
-                if isinstance(as_of_date, str):
-                    as_of_date = datetime.strptime(as_of_date, '%Y-%m-%d').date()
-                as_of_date_query = f"MAX(CASE WHEN as_of_date <= '{as_of_date}' THEN as_of_date END)"
-
+        if table_name == 'funds_total_return_index':
             if start_date is None:
                 query = f"""
-                        WITH latest_as_of_date AS (
-                            SELECT {as_of_date_query} as max_date
-                            FROM {table_name}
-                            WHERE mstar_id = %s
-                        )
-                        SELECT * FROM {table_name}
-                        WHERE mstar_id = %s
-                          AND date <= %s
-                          AND as_of_date = (SELECT max_date FROM latest_as_of_date)
-                        ORDER BY date
-                        """
-                cursor.execute(query, (mstar_id, mstar_id, end_date))
+                WITH latest_as_of_date AS (
+                    SELECT MAX(as_of_date) as max_date
+                    FROM {table_name}
+                    WHERE mstar_id = ANY(%s)
+                      AND as_of_date <= %s
+                )
+                SELECT * FROM {table_name}
+                WHERE mstar_id = ANY(%s)
+                  AND date <= %s
+                  AND as_of_date = (SELECT max_date FROM latest_as_of_date)
+                ORDER BY mstar_id, date
+                """
+                logger.debug(f"Executing query: {query}")
+                logger.debug(f"Query parameters: {(mstar_ids, as_of_date, mstar_ids, as_of_date)}")
+                cursor.execute(query, (mstar_ids, as_of_date, mstar_ids, as_of_date))
             else:
                 query = f"""
-                        WITH latest_as_of_date AS (
-                            SELECT {as_of_date_query} as max_date
-                            FROM {table_name}
-                            WHERE mstar_id = %s
-                        ), earliest_date AS (
-                            SELECT MIN(date) as min_date
-                            FROM {table_name}
-                            WHERE mstar_id = %s AND as_of_date = (SELECT max_date FROM latest_as_of_date)
-                        )
-                        SELECT * FROM {table_name}
-                        WHERE mstar_id = %s
-                          AND date BETWEEN GREATEST(%s, (SELECT min_date FROM earliest_date)) AND %s
-                          AND as_of_date = (SELECT max_date FROM latest_as_of_date)
-                        ORDER BY date
-                        """
-                cursor.execute(query, (mstar_id, mstar_id, mstar_id, start_date, end_date))
+                WITH latest_as_of_date AS (
+                    SELECT MAX(as_of_date) as max_date
+                    FROM {table_name}
+                    WHERE mstar_id = ANY(%s)
+                      AND as_of_date <= %s
+                )
+                SELECT * FROM {table_name}
+                WHERE mstar_id = ANY(%s)
+                  AND date BETWEEN %s AND %s
+                  AND as_of_date = (SELECT max_date FROM latest_as_of_date)
+                ORDER BY mstar_id, date
+                """
+                logger.debug(f"Executing query: {query}")
+                logger.debug(f"Query parameters: {(mstar_ids, as_of_date, mstar_ids, start_date, as_of_date)}")
+                cursor.execute(query, (mstar_ids, as_of_date, mstar_ids, start_date, as_of_date))
         else:
-            # Existing logic for other tables
-            if as_of_date is None or as_of_date == 'latest':
-                query = f"""
-                SELECT * FROM {table_name}
-                WHERE mstar_id = %s
-                ORDER BY as_of_date DESC
-                LIMIT 1
-                """
-                cursor.execute(query, (mstar_id,))
-            else:
-                if isinstance(as_of_date, str):
-                    as_of_date = datetime.strptime(as_of_date, '%Y-%m-%d').date()
-
-                query = f"""
-                SELECT * FROM {table_name}
-                WHERE mstar_id = %s AND as_of_date <= %s
-                ORDER BY as_of_date DESC
-                LIMIT 1
-                """
-                cursor.execute(query, (mstar_id, as_of_date))
+            query = f"""
+            WITH latest_as_of_date AS (
+                SELECT mstar_id, MAX(as_of_date) as max_date
+                FROM {table_name}
+                WHERE mstar_id = ANY(%s)
+                  AND as_of_date <= %s
+                GROUP BY mstar_id
+            )
+            SELECT t.* FROM {table_name} t
+            JOIN latest_as_of_date l ON t.mstar_id = l.mstar_id AND t.as_of_date = l.max_date
+            WHERE t.mstar_id = ANY(%s)
+            ORDER BY t.mstar_id
+            """
+            logger.debug(f"Executing query: {query}")
+            logger.debug(f"Query parameters: {(mstar_ids, as_of_date, mstar_ids)}")
+            cursor.execute(query, (mstar_ids, as_of_date, mstar_ids))
 
         result = cursor.fetchall()
+        logger.debug(f"Query returned {len(result)} rows")
 
         if not result:
-            return {"error": f"No data found for Morningstar ID {mstar_id} in table {table_name}"}
+            return [{"error": f"No data found for Morningstar IDs {mstar_ids} in table {table_name}"}]
 
-        return [ dict(row) for row in result ]
+        return [dict(row) for row in result]
 
     except Exception as e:
-        return {"error": str(e)}
+        logger.exception(f"An error occurred while fetching fund data: {str(e)}")
+        return [{"error": str(e)}]
     finally:
         cursor.close()
         conn.close()
@@ -297,7 +296,7 @@ def raw_df_processing(raw_df):
     df = df.dropna(subset=net_asset_allocation_cols, how='all')
     return df
 
-
+# TODO - remove reference to add_to_db
 def characteristics_processing(df, as_of_date, sec_type, characteristic_type, table_name):
     if characteristic_type == 'asset_allocation':
         processed_df = df[ common_cols + asset_allocation_cols ]
@@ -438,25 +437,174 @@ def insert_chunk(cursor, chunk, table_name):
     cursor.executemany(insert_query, chunk)
 
 
-# fn = '/Users/gokul/Documents/Personal/Prosper/prosper_app/src/datas/data_08_05_2024/raw/performance/OE_MF_Perfomance20240805_gramanathan.csv'
-# performance_processing(filename=fn, as_of_date='2024-08-05', sec_type='OEF', table_name='funds_total_return_index')
+def fetch_fund_symbols(as_of_date, security_types=['ETF', 'MMF', 'OEF', 'CEF']):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            query = """
+                WITH latest_date AS (
+                    SELECT MAX(as_of_date) as max_date
+                    FROM security_master
+                    WHERE security_type = ANY(%s)
+                      AND as_of_date <= %s
+                )
+                SELECT symbol, mstar_id, security_type, as_of_date
+                FROM security_master
+                WHERE security_type = ANY(%s)
+                  AND as_of_date = (SELECT max_date FROM latest_date)
+            """
+            cur.execute(query, (security_types, as_of_date, security_types))
+            results = cur.fetchall()
+            
+            if not results:
+                print(f"No data found for the specified security types up to {as_of_date}")
+                return {}
+            
+            actual_as_of_date = results[0]['as_of_date']
+            if actual_as_of_date != as_of_date:
+                print(f"Using data as of {actual_as_of_date} (requested: {as_of_date})")
+            
+            return {row['symbol']: {'mstar_id': row['mstar_id'], 'security_type': row['security_type']} for row in results}
 
-# etf_char_df = pd.read_csv(
-#     '/Users/gokul/Documents/Personal/Prosper/prosper_app/src/datas/data_08_07_2024/raw/characteristics/etf_universe_characteristics20240807_gramanathan.csv')
-# df = raw_df_processing(etf_char_df)
-# characteristics_processing(df, '2024-08-01', 'ETF', 'market_price_and_cap', 'fund_market_price_and_capitalization')
-# #
-# oef_char_df = pd.read_csv(
-#     '/Users/gokul/Documents/Personal/Prosper/prosper_app/src/datas/data_08_07_2024/raw/characteristics/OE_MF_Characteristics20240807_gramanathan.csv')
-# df = raw_df_processing(oef_char_df)
-# characteristics_processing(df, '2024-08-01', 'OEF', 'market_price_and_cap', 'fund_market_price_and_capitalization')
-# #
-# cef_char_df = pd.read_csv(
-#     '/Users/gokul/Documents/Personal/Prosper/prosper_app/src/datas/data_08_07_2024/raw/characteristics/CE_MF_Characteristics20240807_gramanathan.csv')
-# df = raw_df_processing(cef_char_df)
-# characteristics_processing(df, '2024-08-01', 'CEF', 'market_price_and_cap', 'fund_market_price_and_capitalization')
-#
-# mmf_char_df = pd.read_csv(
-#     '/Users/gokul/Documents/Personal/Prosper/prosper_app/src/datas/data_08_07_2024/raw/characteristics/MMF_Characteristics20240807_gramanathan.csv')
-# df = raw_df_processing(mmf_char_df)
-# characteristics_processing(df, '2024-08-01', 'MMF', 'market_price_and_cap', 'fund_market_price_and_capitalization')
+def process_fund_return_data(df):
+    # Filter to market trading days
+    nyse = mcal.get_calendar('NYSE')
+    market_days = nyse.valid_days(start_date=df['date'].min(), end_date=df['date'].max())
+    market_days = [mkt_date.date() for mkt_date in market_days]
+    df = df.loc[df['date'].isin(market_days)].sort_values(['mstar_id', 'date'], ascending=[True, True])
+
+    # Calculate returns
+    df['return'] = df.groupby('mstar_id')['value'].pct_change()
+    df.dropna(subset='return', inplace=True)
+
+    return df
+
+def calculate_fund_statistics_vectorized(mstar_ids, processed_data, as_of_date, symbol_mstar_map):
+    # Group by mstar_id for calculations
+    grouped = processed_data.groupby('mstar_id')
+    
+    # Calculate trading days
+    trading_days = grouped['return'].size()
+    
+    # Calculate total return
+    total_return = (1 + processed_data['return']).groupby(processed_data['mstar_id']).prod() - 1
+    
+    # Initialize annualized return and volatility series with NaN
+    annualized_return = pd.Series(np.nan, index=trading_days.index)
+    annualized_volatility = pd.Series(np.nan, index=trading_days.index)
+    
+    # Calculate annualized return and volatility only for funds with more than 30 trading days
+    mask = trading_days > 30
+    annualized_return[mask] = (1 + total_return[mask]) ** (252 / trading_days[mask]) - 1
+    annualized_volatility[mask] = grouped['return'].std()[mask] * np.sqrt(252)
+    
+    # Combine results
+    results = pd.DataFrame({
+        'mstar_id': trading_days.index,
+        'annualized_return': annualized_return,
+        'annualized_volatility': annualized_volatility,
+        'as_of_date': as_of_date,
+        'trading_days': trading_days
+    }).reset_index(drop=True)
+    
+    # Map mstar_id to symbol and security_type
+    mstar_id_to_symbol = {v['mstar_id']: k for k, v in symbol_mstar_map.items()}
+    results['symbol'] = results['mstar_id'].map(mstar_id_to_symbol)
+    results['security_type'] = results['mstar_id'].map(lambda x: symbol_mstar_map[mstar_id_to_symbol[x]]['security_type'])
+    
+    print(f"Processed {len(results)} funds")
+    
+    return results
+
+def process_chunk(chunk, as_of_date, symbol_mstar_map):
+    try:
+        # 1. Fetch return data for the chunk
+        returns_data = fetch_fund_data(chunk, 'funds_total_return_index', as_of_date)
+        
+        # 2. Check that fetched return data is valid
+        if isinstance(returns_data, list) and returns_data and isinstance(returns_data[0], dict) and 'error' in returns_data[0]:
+            print(f"Error fetching return data for chunk: {returns_data[0]['error']}")
+            return None
+        
+        # 3. Convert fetched return data to dataframe
+        returns_df = pd.DataFrame(returns_data)
+        
+        # 4. Process the dataframe return data
+        processed_data = process_fund_return_data(returns_df)
+        
+        # 5. Calculate fund statistics vectorized on this dataframe
+        results = calculate_fund_statistics_vectorized(chunk, processed_data, as_of_date, symbol_mstar_map)
+        
+        # 6. Insert the processed chunk into the historical_return_statistics table
+        insert_historical_return_statistics(results)
+        
+        return results
+    except Exception as e:
+        print(f"Error processing chunk: {str(e)}")
+        return None
+
+def calculate_fund_annualized_statistics(as_of_date, num_workers):
+    # Fetch fund symbols and their mstar_ids
+    symbol_mstar_map = fetch_fund_symbols(as_of_date)
+    mstar_ids = [info['mstar_id'] for info in symbol_mstar_map.values()]
+    
+    # Split mstar_ids into chunks for parallel processing
+    chunk_size = 100  # Adjust this value based on your needs
+    mstar_id_chunks = [mstar_ids[i:i + chunk_size] for i in range(0, len(mstar_ids), chunk_size)]
+    
+    # Use parallel processing to process each chunk
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        process_chunk_partial = partial(process_chunk, as_of_date=as_of_date, symbol_mstar_map=symbol_mstar_map)
+        futures = [executor.submit(process_chunk_partial, chunk) for chunk in mstar_id_chunks]
+        
+        results = []
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(mstar_id_chunks), desc="Processing chunks"):
+            chunk_result = future.result()
+            if chunk_result is not None:
+                results.append(chunk_result)
+    
+    # Combine results from all chunks
+    if results:
+        results_df = pd.concat(results, ignore_index=True)
+        print(f"Calculated and inserted annualized statistics for {len(results_df)} fund securities.")
+    else:
+        print("No valid results were produced.")
+
+# Modify the insert_historical_return_statistics function to handle smaller chunks
+def insert_historical_return_statistics(results_df):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for _, row in results_df.iterrows():
+                cur.execute("""
+                    INSERT INTO historical_return_statistics 
+                    (symbol, security_type, annualized_return, annualized_volatility, as_of_date, num_trading_days)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (symbol, security_type, as_of_date) 
+                    DO UPDATE SET 
+                        annualized_return = EXCLUDED.annualized_return,
+                        annualized_volatility = EXCLUDED.annualized_volatility,
+                        num_trading_days = EXCLUDED.num_trading_days,
+                        created_at = CURRENT_TIMESTAMP
+                """, (
+                    row['symbol'],
+                    row['security_type'],
+                    row['annualized_return'],
+                    row['annualized_volatility'],
+                    row['as_of_date'],
+                    row['trading_days']
+                ))
+            conn.commit()
+    
+    print(f"Inserted annualized statistics for {len(results_df)} fund securities.")
+
+# Add this to your main function or create a new function to run the fund statistics calculation
+def calculate_fund_stats(as_of_date, num_workers):
+    start_time = time.time()
+    calculate_fund_annualized_statistics(as_of_date, num_workers)
+    end_time = time.time()
+    duration = end_time - start_time
+    log_to_csv('Fund Annualized Statistics', duration)
+    logging.info(f"Fund annualized statistics calculation completed in {duration:.2f} seconds")
+
+# You can add this to your main function
+calculate_fund_stats('2024-09-10', 25)
+
