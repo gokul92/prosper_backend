@@ -24,6 +24,7 @@ from ..domain_logic.simulation import simulate_balance_paths
 from ..utils.calcs import portfolio_statistics
 from ..domain_logic.tax_rates_calc import IncomeTaxRates
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime
 from functools import lru_cache
@@ -154,6 +155,9 @@ class AccountCreate(BaseModel):
 
 
 # Database connection function
+from contextlib import contextmanager
+
+@contextmanager
 def get_db_connection():
     conn = psycopg.connect(
         dbname=os.getenv("DB_NAME"),
@@ -161,6 +165,7 @@ def get_db_connection():
         password=os.getenv("DB_PASSWORD"),
         host=os.getenv("DB_HOST"),
         port=os.getenv("DB_PORT"),
+        row_factory=dict_row
     )
     try:
         yield conn
@@ -169,54 +174,54 @@ def get_db_connection():
 
 
 @app.post("/create-account")
-async def create_account(
+def create_account(
     account: AccountCreate,
-    current_user: str = Depends(get_current_user),
-    conn: psycopg.Connection = Depends(get_db_connection),
+    current_user: str = Depends(get_current_user)
 ):
-    account_id = str(uuid4())
-    as_of_date = date.today()
+    with get_db_connection() as conn:
+        account_id = str(uuid4())
+        as_of_date = date.today()
 
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO accounts (account_id, user_id, account_nickname, brokerage, account_type, connection_type, connection_status, as_of_date)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-                (
-                    account_id,
-                    current_user,
-                    account.account_nickname,
-                    account.brokerage,
-                    account.account_type,
-                    account.connection_type,
-                    account.connection_status,
-                    as_of_date,
-                ),
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO accounts (account_id, user_id, account_nickname, brokerage, account_type, connection_type, connection_status, as_of_date)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                    (
+                        account_id,
+                        current_user,
+                        account.account_nickname,
+                        account.brokerage,
+                        account.account_type,
+                        account.connection_type,
+                        account.connection_status,
+                        as_of_date,
+                    ),
+                )
+            conn.commit()
+        except psycopg_errors.UniqueViolation:
+            raise HTTPException(
+                status_code=409, detail="Account with this ID already exists"
             )
-        conn.commit()
-    except psycopg_errors.UniqueViolation:
-        raise HTTPException(
-            status_code=409, detail="Account with this ID already exists"
-        )
-    except psycopg_errors.ForeignKeyViolation:
-        raise HTTPException(status_code=400, detail="Invalid user ID")
-    except psycopg_errors.CheckViolation:
-        raise HTTPException(status_code=400, detail="Invalid connection type or status")
-    except psycopg_errors.NotNullViolation:
-        raise HTTPException(status_code=400, detail="Missing required fields")
-    except psycopg.Error as e:
-        conn.rollback()
-        logger.error(f"Database error while creating account: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        except psycopg_errors.ForeignKeyViolation:
+            raise HTTPException(status_code=400, detail="Invalid user ID")
+        except psycopg_errors.CheckViolation:
+            raise HTTPException(status_code=400, detail="Invalid connection type or status")
+        except psycopg_errors.NotNullViolation:
+            raise HTTPException(status_code=400, detail="Missing required fields")
+        except psycopg.Error as e:
+            conn.rollback()
+            logger.error(f"Database error while creating account: {str(e)}")
+            raise HTTPException(status_code=500, detail="Internal server error")
 
-    return {
-        "status": "success",
-        "message": "Account created successfully",
-        "account_id": account_id,
-        "as_of_date": as_of_date,
-    }
+        return {
+            "status": "success",
+            "message": "Account created successfully",
+            "account_id": account_id,
+            "as_of_date": as_of_date,
+        }
 
 
 # New endpoint for adding account holdings
@@ -239,104 +244,104 @@ class AccountHoldingsCreate(BaseModel):
 
 
 @app.post("/add-account-holdings")
-async def add_account_holdings(
+def add_account_holdings(
     holdings_data: AccountHoldingsCreate,
-    current_user: str = Depends(get_current_user),
-    conn: psycopg.Connection = Depends(get_db_connection),
+    current_user: str = Depends(get_current_user)
 ):
-    try:
-        with conn.cursor(row_factory=dict_row) as cur:
-            # Check if the account exists and belongs to the current user
-            cur.execute(
-                "SELECT 1 FROM accounts WHERE account_id = %s AND user_id = %s",
-                (holdings_data.account_id, current_user),
-            )
-            if cur.fetchone() is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Account not found or doesn't belong to the current user",
+    with get_db_connection() as conn:
+        try:
+            with conn.cursor(row_factory=dict_row) as cur:
+                # Check if the account exists and belongs to the current user
+                cur.execute(
+                    "SELECT 1 FROM accounts WHERE account_id = %s AND user_id = %s",
+                    (holdings_data.account_id, current_user),
                 )
+                if cur.fetchone() is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Account not found or doesn't belong to the current user",
+                    )
 
-            # Validate symbols against security_master
-            symbols = [holding.symbol for holding in holdings_data.holdings]
-            cur.execute(
+                # Validate symbols against security_master
+                symbols = [holding.symbol for holding in holdings_data.holdings]
+                cur.execute(
+                    """
+                    SELECT DISTINCT ON (symbol)
+                        symbol,
+                        security_type,
+                        security_name
+                    FROM security_master
+                    WHERE symbol = ANY(%s)
+                    ORDER BY symbol, CASE 
+                        WHEN security_type != 'Equity' THEN 0
+                        ELSE 1
+                    END, as_of_date DESC
+                """,
+                    (symbols,),
+                )
+                validated_symbols = cur.fetchall()
+
+                unknown_symbols = [
+                    symbol
+                    for symbol in symbols
+                    if symbol not in [vs["symbol"] for vs in validated_symbols]
+                ]
+
+                if unknown_symbols:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unknown symbols: {', '.join(unknown_symbols)}",
+                    )
+
+                # Prepare the query for inserting multiple holdings
+                insert_query = """
+                    INSERT INTO account_holdings 
+                    (account_id, symbol, quantity, adjusted_cost_basis, as_of_date)
+                    VALUES (%s, %s, %s, %s, COALESCE(%s, CURRENT_DATE))
                 """
-                SELECT DISTINCT ON (symbol)
-                    symbol,
-                    security_type,
-                    security_name
-                FROM security_master
-                WHERE symbol = ANY(%s)
-                ORDER BY symbol, CASE 
-                    WHEN security_type != 'Equity' THEN 0
-                    ELSE 1
-                END, as_of_date DESC
-            """,
-                (symbols,),
+
+                # Prepare the data for bulk insert
+                insert_data = [
+                    (
+                        holdings_data.account_id,
+                        holding.symbol,
+                        holding.quantity,
+                        holding.adjusted_cost_basis,
+                        holding.as_of_date,
+                    )
+                    for holding in holdings_data.holdings
+                ]
+
+                # Execute the bulk insert
+                cur.executemany(insert_query, insert_data)
+
+            conn.commit()
+        except HTTPException:
+            conn.rollback()
+            raise
+        except psycopg_errors.ForeignKeyViolation:
+            conn.rollback()
+            raise HTTPException(status_code=400, detail="Invalid account ID")
+        except psycopg_errors.CheckViolation as e:
+            conn.rollback()
+            raise HTTPException(status_code=400, detail=f"Constraint violation: {str(e)}")
+        except psycopg_errors.UniqueViolation:
+            conn.rollback()
+            raise HTTPException(
+                status_code=409, detail="Duplicate entry for account holdings"
             )
-            validated_symbols = cur.fetchall()
+        except psycopg_errors.NotNullViolation:
+            conn.rollback()
+            raise HTTPException(status_code=400, detail="Missing required fields")
+        except psycopg.Error as e:
+            conn.rollback()
+            logger.error(f"Database error while adding account holdings: {str(e)}")
+            raise HTTPException(status_code=500, detail="Internal server error")
 
-            unknown_symbols = [
-                symbol
-                for symbol in symbols
-                if symbol not in [vs["symbol"] for vs in validated_symbols]
-            ]
-
-            if unknown_symbols:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unknown symbols: {', '.join(unknown_symbols)}",
-                )
-
-            # Prepare the query for inserting multiple holdings
-            insert_query = """
-                INSERT INTO account_holdings 
-                (account_id, symbol, quantity, adjusted_cost_basis, as_of_date)
-                VALUES (%s, %s, %s, %s, COALESCE(%s, CURRENT_DATE))
-            """
-
-            # Prepare the data for bulk insert
-            insert_data = [
-                (
-                    holdings_data.account_id,
-                    holding.symbol,
-                    holding.quantity,
-                    holding.adjusted_cost_basis,
-                    holding.as_of_date,
-                )
-                for holding in holdings_data.holdings
-            ]
-
-            # Execute the bulk insert
-            cur.executemany(insert_query, insert_data)
-
-        conn.commit()
-    except HTTPException:
-        conn.rollback()
-        raise
-    except psycopg_errors.ForeignKeyViolation:
-        conn.rollback()
-        raise HTTPException(status_code=400, detail="Invalid account ID")
-    except psycopg_errors.CheckViolation as e:
-        conn.rollback()
-        raise HTTPException(status_code=400, detail=f"Constraint violation: {str(e)}")
-    except psycopg_errors.UniqueViolation:
-        conn.rollback()
-        raise HTTPException(
-            status_code=409, detail="Duplicate entry for account holdings"
-        )
-    except psycopg_errors.NotNullViolation:
-        conn.rollback()
-        raise HTTPException(status_code=400, detail="Missing required fields")
-    except psycopg.Error as e:
-        conn.rollback()
-        logger.error(f"Database error while adding account holdings: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-    return {
-        "status": "success",
-        "message": f"Added {len(holdings_data.holdings)} holdings to the account",
-    }
+        return {
+            "status": "success",
+            "message": f"Added {len(holdings_data.holdings)} holdings to the account",
+        }
 
 
 # New endpoint for receiving tax rates information
@@ -349,85 +354,85 @@ class TaxRatesInformation(BaseModel):
 
 
 @app.post("/tax-rates")
-async def calculate_tax_rates(
+def calculate_tax_rates(
     tax_info: dict,
-    current_user: str = Depends(get_current_user),
-    conn: psycopg.Connection = Depends(get_db_connection),
+    current_user: str = Depends(get_current_user)
 ):
-    validated_tax_info = validate_payload(TaxRatesInformation, tax_info)
+    with get_db_connection() as conn:
+        validated_tax_info = validate_payload(TaxRatesInformation, tax_info)
 
-    # Verify that the current_user matches the user_id in the payload
-    if current_user != validated_tax_info.user_id:
-        raise HTTPException(status_code=403, detail="User ID mismatch")
+        # Verify that the current_user matches the user_id in the payload
+        if current_user != validated_tax_info.user_id:
+            raise HTTPException(status_code=403, detail="User ID mismatch")
 
-    try:
-        # Insert tax rates information
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                """
-                INSERT INTO tax_rates_information 
-                (user_id, state, annual_income, age, filing_status)
-                VALUES (%s, %s, %s, %s, %s)
-                RETURNING tax_rates_information_id, as_of_date
-            """,
-                (
-                    validated_tax_info.user_id,
-                    validated_tax_info.state,
-                    validated_tax_info.annual_income,
-                    validated_tax_info.age,
-                    validated_tax_info.filing_status,
-                ),
+        try:
+            # Insert tax rates information
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    INSERT INTO tax_rates_information 
+                    (user_id, state, annual_income, age, filing_status)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING tax_rates_information_id, as_of_date
+                """,
+                    (
+                        validated_tax_info.user_id,
+                        validated_tax_info.state,
+                        validated_tax_info.annual_income,
+                        validated_tax_info.age,
+                        validated_tax_info.filing_status,
+                    ),
+                )
+                result = cur.fetchone()
+                tax_rates_information_id = result["tax_rates_information_id"]
+                as_of_date = result["as_of_date"]
+
+            # Calculate tax rates
+            tax_calculator = IncomeTaxRates(
+                validated_tax_info.state,
+                validated_tax_info.annual_income,
+                validated_tax_info.filing_status,
             )
-            result = cur.fetchone()
-            tax_rates_information_id = result["tax_rates_information_id"]
-            as_of_date = result["as_of_date"]
+            income_tax_rates = tax_calculator.calculate_income_tax_rate()
+            ltcg_rates = tax_calculator.calculate_ltcg_rate()
 
-        # Calculate tax rates
-        tax_calculator = IncomeTaxRates(
-            validated_tax_info.state,
-            validated_tax_info.annual_income,
-            validated_tax_info.filing_status,
-        )
-        income_tax_rates = tax_calculator.calculate_income_tax_rate()
-        ltcg_rates = tax_calculator.calculate_ltcg_rate()
+            # Insert calculated tax rates
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO tax_rates 
+                    (tax_rates_information_id, user_id, federal_income_tax_rate, state_income_tax_rate, 
+                    federal_long_term_capital_gains_rate, state_long_term_capital_gains_rate, as_of_date)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                    (
+                        tax_rates_information_id,
+                        validated_tax_info.user_id,
+                        income_tax_rates["federal_rate"],
+                        income_tax_rates["state_rate"],
+                        ltcg_rates["federal_rate"],
+                        ltcg_rates["state_rate"],
+                        as_of_date,
+                    ),
+                )
 
-        # Insert calculated tax rates
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO tax_rates 
-                (tax_rates_information_id, user_id, federal_income_tax_rate, state_income_tax_rate, 
-                federal_long_term_capital_gains_rate, state_long_term_capital_gains_rate, as_of_date)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """,
-                (
-                    tax_rates_information_id,
-                    validated_tax_info.user_id,
-                    income_tax_rates["federal_rate"],
-                    income_tax_rates["state_rate"],
-                    ltcg_rates["federal_rate"],
-                    ltcg_rates["state_rate"],
-                    as_of_date,
-                ),
-            )
+            conn.commit()
 
-        conn.commit()
+            # Prepare response
+            response = {
+                "status": "success",
+                "federal_income_tax_rate": income_tax_rates["federal_rate"],
+                "state_income_tax_rate": income_tax_rates["state_rate"],
+                "federal_long_term_capital_gains_rate": ltcg_rates["federal_rate"],
+                "state_long_term_capital_gains_rate": ltcg_rates["state_rate"],
+            }
 
-        # Prepare response
-        response = {
-            "status": "success",
-            "federal_income_tax_rate": income_tax_rates["federal_rate"],
-            "state_income_tax_rate": income_tax_rates["state_rate"],
-            "federal_long_term_capital_gains_rate": ltcg_rates["federal_rate"],
-            "state_long_term_capital_gains_rate": ltcg_rates["state_rate"],
-        }
+            return response
 
-        return response
-
-    except psycopg.Error as e:
-        conn.rollback()
-        logger.error(f"Database error while processing tax rates: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        except psycopg.Error as e:
+            conn.rollback()
+            logger.error(f"Database error while processing tax rates: {str(e)}")
+            raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # Pydantic model for user creation request
@@ -441,55 +446,53 @@ class UserCreate(BaseModel):
     user_created_at: datetime = None
 
 @app.post("/add-user")
-async def add_user(
-    user: UserCreate,
-    conn: psycopg.Connection = Depends(get_db_connection),
-):
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO users (user_id, email_id, name, nickname, picture, email_verified, user_created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    user.user_id,
-                    user.email_id,
-                    user.name,
-                    user.nickname,
-                    user.picture,
-                    user.email_verified,
-                    user.user_created_at or datetime.utcnow(),
-                ),
+def add_user(user: UserCreate):
+    with get_db_connection() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO users (user_id, email_id, name, nickname, picture, email_verified, user_created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        user.user_id,
+                        user.email_id,
+                        user.name,
+                        user.nickname,
+                        user.picture,
+                        user.email_verified,
+                        user.user_created_at or datetime.utcnow(),
+                    ),
+                )
+            conn.commit()
+        except psycopg_errors.UniqueViolation:
+            conn.rollback()
+            raise HTTPException(
+                status_code=409, detail="User with this ID or email already exists"
             )
-        conn.commit()
-    except psycopg_errors.UniqueViolation:
-        conn.rollback()
-        raise HTTPException(
-            status_code=409, detail="User with this ID or email already exists"
-        )
-    except psycopg_errors.NotNullViolation:
-        conn.rollback()
-        raise HTTPException(status_code=400, detail="Missing required fields")
-    except psycopg.Error as e:
-        conn.rollback()
-        logger.error(f"Database error while adding user: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        except psycopg_errors.NotNullViolation:
+            conn.rollback()
+            raise HTTPException(status_code=400, detail="Missing required fields")
+        except psycopg.Error as e:
+            conn.rollback()
+            logger.error(f"Database error while adding user: {str(e)}")
+            raise HTTPException(status_code=500, detail="Internal server error")
 
-    return {
-        "status": "success",
-        "message": "User added successfully",
-        "user_id": user.user_id
-    }
+        return {
+            "status": "success",
+            "message": "User added successfully",
+            "user_id": user.user_id
+        }
 
-async def fetch_account_statistics(
+def fetch_account_statistics(
     account_id: UUID4,
     current_user: str,
     conn: psycopg.Connection
 ) -> dict:
     try:
         # Check if the account belongs to the current user
-        with conn.cursor(row_factory=dict_row) as cur:
+        with conn.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM accounts WHERE account_id = %s AND user_id = %s",
                 (account_id, current_user)
@@ -519,12 +522,12 @@ async def fetch_account_statistics(
         raise HTTPException(status_code=500, detail="Error calculating account statistics")
 
 @app.get("/account-statistics/{account_id}")
-async def get_account_statistics(
+def get_account_statistics(
     account_id: UUID4,
-    current_user: str = Depends(get_current_user),
-    conn: psycopg.Connection = Depends(get_db_connection)
+    current_user: str = Depends(get_current_user)
 ):
-    return await fetch_account_statistics(account_id, current_user, conn)
+    with get_db_connection() as conn:
+        return fetch_account_statistics(account_id, current_user, conn)
 
 
 # LRU cache for in-memory caching
@@ -544,10 +547,9 @@ class MonteCarloSimulationRequest(BaseModel):
     account_id: UUID4
 
 @app.post("/monte-carlo-simulation")
-async def monte_carlo_simulation(
+def monte_carlo_simulation(
     request: MonteCarloSimulationRequest,
-    current_user: str = Depends(get_current_user),
-    conn: psycopg.Connection = Depends(get_db_connection)
+    current_user: str = Depends(get_current_user)
 ):
     try:
         account_id = str(request.account_id)
@@ -560,74 +562,80 @@ async def monte_carlo_simulation(
         if cached_result:
             return cached_result
 
-        # Check database cache
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                "SELECT result FROM monte_carlo_cache WHERE cache_key = %s",
-                (cache_key,)
+        with get_db_connection() as conn:
+            # Check database cache
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT result FROM monte_carlo_cache WHERE cache_key = %s",
+                    (cache_key,)
+                )
+                db_cached_result = cur.fetchone()
+                if db_cached_result:
+                    # Update in-memory cache and return result
+                    get_cached_simulation.cache_clear()
+                    get_cached_simulation(cache_key)
+                    return db_cached_result['result']
+
+            # If not cached, perform the simulation
+            # Fetch account details
+            account_stats = fetch_account_statistics(account_id, current_user, conn)
+
+            # Simulate balance paths
+            start_date = date.today().isoformat()
+            simulation_result = simulate_balance_paths(
+                starting_balance=account_stats["account_balance"],
+                annual_mean=account_stats["annual_mean_return"],
+                annual_std_dev=account_stats["annual_std_dev"],
+                start_date=start_date
             )
-            db_cached_result = cur.fetchone()
-            if db_cached_result:
-                # Update in-memory cache and return result
-                get_cached_simulation.cache_clear()
-                get_cached_simulation(cache_key)
-                return db_cached_result['result']
 
-        # If not cached, perform the simulation
-        # Fetch account details
-        account_stats = await fetch_account_statistics(account_id, current_user, conn)
+            # Prepare response
+            response = {
+                "account_id": account_id,
+                "account_info": account_stats,
+                "simulation_start_date": start_date,
+                "dates": simulation_result["dates"],
+                "balance_paths": simulation_result["balance_paths"].to_dict(),
+                "percentile_95_balance_path": simulation_result["percentile_95_balance_path"].to_dict(),
+                "percentile_5_balance_path": simulation_result["percentile_5_balance_path"].to_dict(),
+                "prob_95_percentile": float(simulation_result["prob_95_percentile"]),
+                "prob_5_percentile": float(simulation_result["prob_5_percentile"]),
+                "final_balance_min": float(simulation_result["final_balance_min"]),
+                "final_balance_max": float(simulation_result["final_balance_max"]),
+                "final_95_percentile_balance": float(simulation_result["final_95_percentile_balance"]),
+                "final_5_percentile_balance": float(simulation_result["final_5_percentile_balance"]),
+                "prob_greater_than_starting": float(simulation_result["prob_greater_than_starting"]),
+                "prob_between_starting_and_95": float(simulation_result["prob_between_starting_and_95"]),
+                "prob_between_5_and_starting": float(simulation_result["prob_between_5_and_starting"]),
+                "percentile_95_balance_1y": float(simulation_result["percentile_95_balance_1y"]),
+                "percentile_5_balance_1y": float(simulation_result["percentile_5_balance_1y"])
+            }
 
-        # Simulate balance paths
-        start_date = date.today().isoformat()
-        simulation_result = simulate_balance_paths(
-            starting_balance=account_stats["account_balance"],
-            annual_mean=account_stats["annual_mean_return"],
-            annual_std_dev=account_stats["annual_std_dev"],
-            start_date=start_date
-        )
+            # Write response to JSON file
+            # data_dir = Path(__file__).parent.parent.parent / 'data' / 'temp_debug'
+            # data_dir.mkdir(exist_ok=True)
+            # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            # file_name = f"monte_carlo_simulation_{account_id}_{timestamp}.json"
+            # file_path = data_dir / file_name
 
-        # Prepare response
-        response = {
-            "account_id": account_id,
-            "account_info": account_stats,
-            "simulation_start_date": start_date,
-            "dates": simulation_result["dates"],
-            "balance_paths": simulation_result["balance_paths"].to_dict(),
-            "percentile_95_balance_path": simulation_result["percentile_95_balance_path"].to_dict(),
-            "percentile_5_balance_path": simulation_result["percentile_5_balance_path"].to_dict(),
-            "prob_95_percentile": float(simulation_result["prob_95_percentile"]),
-            "prob_5_percentile": float(simulation_result["prob_5_percentile"]),
-            "final_balance_min": float(simulation_result["final_balance_min"]),
-            "final_balance_max": float(simulation_result["final_balance_max"]),
-            "final_95_percentile_balance": float(simulation_result["final_95_percentile_balance"]),
-            "final_5_percentile_balance": float(simulation_result["final_5_percentile_balance"])
-        }
+            # with open(file_path, 'w') as f:
+            #     json.dump(response, f, indent=2, default=str)
 
-        # Write response to JSON file
-        data_dir = Path(__file__).parent.parent.parent / 'data' / 'temp_debug'
-        data_dir.mkdir(exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_name = f"monte_carlo_simulation_{account_id}_{timestamp}.json"
-        file_path = data_dir / file_name
+            # logger.info(f"Monte Carlo simulation result saved to {file_path}")
 
-        with open(file_path, 'w') as f:
-            json.dump(response, f, indent=2, default=str)
+            # Cache the result
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO monte_carlo_cache (cache_key, result) VALUES (%s, %s) ON CONFLICT (cache_key) DO UPDATE SET result = EXCLUDED.result, created_at = CURRENT_TIMESTAMP",
+                    (cache_key, json.dumps(response))
+                )
+            conn.commit()
 
-        logger.info(f"Monte Carlo simulation result saved to {file_path}")
+            # Update in-memory cache
+            get_cached_simulation.cache_clear()
+            get_cached_simulation(cache_key)
 
-        # Cache the result
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO monte_carlo_cache (cache_key, result) VALUES (%s, %s) ON CONFLICT (cache_key) DO UPDATE SET result = EXCLUDED.result, created_at = CURRENT_TIMESTAMP",
-                (cache_key, json.dumps(response))
-            )
-        conn.commit()
-
-        # Update in-memory cache
-        get_cached_simulation.cache_clear()
-        get_cached_simulation(cache_key)
-
-        return response
+            return response
 
     except RequestValidationError as e:
         logger.error(f"Validation error: {str(e)}")
@@ -643,19 +651,19 @@ async def monte_carlo_simulation(
 
 # Add a new endpoint to clear the cache if needed
 @app.post("/clear-monte-carlo-cache")
-async def clear_monte_carlo_cache(
-    current_user: str = Depends(get_current_user),
-    conn: psycopg.Connection = Depends(get_db_connection)
+def clear_monte_carlo_cache(
+    current_user: str = Depends(get_current_user)
 ):
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM monte_carlo_cache")
-        conn.commit()
-        get_cached_simulation.cache_clear()
-        return {"message": "Monte Carlo simulation cache cleared"}
-    except psycopg.Error as e:
-        logger.error(f"Database error while clearing Monte Carlo cache: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+    with get_db_connection() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM monte_carlo_cache")
+            conn.commit()
+            get_cached_simulation.cache_clear()
+            return {"message": "Monte Carlo simulation cache cleared"}
+        except psycopg.Error as e:
+            logger.error(f"Database error while clearing Monte Carlo cache: {str(e)}")
+            raise HTTPException(status_code=500, detail="Internal server error")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
