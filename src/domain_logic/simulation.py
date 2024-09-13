@@ -94,9 +94,21 @@ def simulate_balance_paths(starting_balance: float, annual_mean: float, annual_s
     # Calculate probabilities
     one_year_index = min(252, len(balance_paths) - 1)  # Ensure we don't go out of bounds
     one_year_balances = balance_paths.iloc[one_year_index]
-    starting_balance_percentile = (one_year_balances < starting_balance).mean()
-    prob_95_percentile = 0.95 - starting_balance_percentile
-    prob_5_percentile = starting_balance_percentile - 0.05
+    
+    # Probability that balance will be greater than current balance
+    prob_greater_than_starting = (one_year_balances > starting_balance).mean()
+    
+    # 95th percentile balance at one year
+    percentile_95_balance = np.percentile(one_year_balances, 95)
+    
+    # 5th percentile balance at one year
+    percentile_5_balance = np.percentile(one_year_balances, 5)
+    
+    # Probability that balance will be greater than current balance but lower than 95th percentile
+    prob_between_starting_and_95 = ((one_year_balances > starting_balance) & (one_year_balances < percentile_95_balance)).mean()
+    
+    # Probability that balance will be lower than current balance but greater than 5th percentile
+    prob_between_5_and_starting = ((one_year_balances < starting_balance) & (one_year_balances > percentile_5_balance)).mean()
 
     # Convert index to datetime for resampling
     balance_paths.index = pd.to_datetime(balance_paths.index)
@@ -126,13 +138,18 @@ def simulate_balance_paths(starting_balance: float, annual_mean: float, annual_s
         "balance_paths": balance_paths_monthly,
         "percentile_95_balance_path": percentile_95_path_monthly,
         "percentile_5_balance_path": percentile_5_path_monthly,
-        "prob_95_percentile": prob_95_percentile,
-        "prob_5_percentile": prob_5_percentile,
+        "prob_95_percentile": 0.95 - prob_greater_than_starting,
+        "prob_5_percentile": 1 - prob_greater_than_starting - 0.05,
         "final_balance_min": balance_paths_monthly.iloc[-1].min(),
         "final_balance_max": balance_paths_monthly.iloc[-1].max(),
         "final_95_percentile_balance": percentile_95_path_monthly.iloc[-1],
         "final_5_percentile_balance": percentile_5_path_monthly.iloc[-1],
-        "dates": dates
+        "dates": dates,
+        "prob_greater_than_starting": prob_greater_than_starting,
+        "prob_between_starting_and_95": prob_between_starting_and_95,
+        "prob_between_5_and_starting": prob_between_5_and_starting,
+        "percentile_95_balance_1y": percentile_95_balance,
+        "percentile_5_balance_1y": percentile_5_balance
     }
 
     return result
