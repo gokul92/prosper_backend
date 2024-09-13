@@ -10,6 +10,7 @@ import json
 import datetime
 from src.domain_logic.optimization import PortfolioOptimizer
 from src.domain_logic.simulation import simulate_balance_paths
+from contextlib import contextmanager
 
 load_dotenv()
 
@@ -20,9 +21,15 @@ db_pass = os.getenv('DB_PASSWORD')
 db_name = os.getenv('DB_NAME')
 db_port = os.getenv('DB_PORT')
 
+
+@contextmanager
 def get_connection():
-    return psycopg.connect(f'host={db_host} port={db_port} dbname={db_name} user={db_user} password={db_pass}',
+    conn = psycopg.connect(f'host={db_host} port={db_port} dbname={db_name} user={db_user} password={db_pass}',
                            row_factory=dict_row)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 def fetch_account_data(account_id: str, as_of_date: str) -> Dict:
     query = """
@@ -196,12 +203,11 @@ def calculate_portfolio_return(weights: Dict[str, Dict[str, float]]) -> float:
     return sum(data['weight'] * data['return'] for data in weights.values())
 
 def calculate_covariances(return_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    if not return_data:
-        return pd.DataFrame()  # Return an empty DataFrame if there's no data
-
-    # Find the common date range
-    common_dates = list(set.intersection(*[set(data.index) for data in return_data.values()]))
-    common_dates.sort()  # Ensure dates are in order
+    if return_data:
+        common_dates = list(set.intersection(*[set(data.index) for data in return_data.values()]))
+        common_dates.sort()  # Ensure dates are in order
+    else:
+        common_dates = []  # or handle the empty case as appropriate for your use case
     
     # Filter returns to only include common dates
     filtered_returns = {symbol: data.loc[common_dates]['return'] for symbol, data in return_data.items()}
@@ -302,6 +308,7 @@ def portfolio_statistics(account_id: str, as_of_date: str, return_portfolio_deta
 
 def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Union[float, Dict]]:
     # Fetch portfolio statistics with return data
+    # TODO - If account holdings has cash as $$$$ then this does not know to fetch VUSXX total return for cash. 
     stats = portfolio_statistics(account_id, as_of_date, return_portfolio_detail=True)
     
     return_data = stats['return_data']
@@ -436,14 +443,14 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
     }
 
 # Example usage:
-optimized_stats = optimized_portfolio_stats('7551d266-f561-4e9f-9fc1-a1faa31af499', '2024-09-07')
+# optimized_stats = optimized_portfolio_stats('7551d266-f561-4e9f-9fc1-a1faa31af499', '2024-09-07')
 
-# Write optimized_stats to a JSON file in the @data/temp_debug folder
-output_folder = '/Users/gokul/Dropbox/Mac/Documents/Personal/Prosper/prosper_backend/data/temp_debug'
-os.makedirs(output_folder, exist_ok=True)
-output_file = os.path.join(output_folder, 'optimized_stats.json')
+# # Write optimized_stats to a JSON file in the @data/temp_debug folder
+# output_folder = '/Users/gokul/Dropbox/Mac/Documents/Personal/Prosper/prosper_backend/data/temp_debug'
+# os.makedirs(output_folder, exist_ok=True)
+# output_file = os.path.join(output_folder, 'optimized_stats.json')
 
-with open(output_file, 'w') as f:
-    json.dump(optimized_stats, f, indent=2, default=str)
+# with open(output_file, 'w') as f:
+#     json.dump(optimized_stats, f, indent=2, default=str)
 
-print(f"Optimized stats written to {output_file}")
+# print(f"Optimized stats written to {output_file}")
