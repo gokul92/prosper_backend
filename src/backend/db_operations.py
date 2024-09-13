@@ -4,8 +4,7 @@ from typing import Dict, Union, List
 import uuid
 import os
 from dotenv import load_dotenv
-from token_generator import encrypt_id
-import getopt
+from .token_generator import encrypt_id
 
 load_dotenv()
 
