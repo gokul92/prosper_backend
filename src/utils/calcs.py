@@ -21,7 +21,6 @@ db_pass = os.getenv('DB_PASSWORD')
 db_name = os.getenv('DB_NAME')
 db_port = os.getenv('DB_PORT')
 
-
 @contextmanager
 def get_connection():
     conn = psycopg.connect(f'host={db_host} port={db_port} dbname={db_name} user={db_user} password={db_pass}',
@@ -120,34 +119,64 @@ def fetch_total_return_indices(symbols: List[str], symbol_types: Dict[str, str],
             total_return_indices[symbol].append({'date': row['date'], 'value': row['value']})
     
     if fund_symbols:
-        fund_query = """
-        WITH security_master_data AS (
-            SELECT symbol, mstar_id
-            FROM security_master
-            WHERE symbol = ANY(%s)
-              AND security_type IN ('OEF', 'CEF', 'ETF', 'MMF')
-              AND as_of_date <= %s
-            ORDER BY as_of_date DESC
-            LIMIT 1
-        ),
-        latest_as_of_date AS (
-            SELECT mstar_id, MAX(as_of_date) as as_of_date
-            FROM funds_total_return_index
-            WHERE mstar_id IN (SELECT mstar_id FROM security_master_data)
-              AND as_of_date <= %s
-            GROUP BY mstar_id
-        )
+        placeholders = ','.join(['%s'] * len(fund_symbols))
+        
+        # Query 1: Get security_master data
+        security_master_query = f"""
+        SELECT symbol, mstar_id
+        FROM security_master
+        WHERE symbol IN ({placeholders})
+          AND security_type IN ('OEF', 'CEF', 'ETF', 'MMF')
+          AND as_of_date <= %s
+        ORDER BY symbol, as_of_date DESC
+        """
+        
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(security_master_query, fund_symbols + [as_of_date])
+                security_master_results = cur.fetchall()
+        
+        if not security_master_results:
+            logger.error(f"No security master data found for symbols: {fund_symbols}")
+            return {}
+        
+        # Query 2: Get latest as_of_date for each mstar_id
+        mstar_ids = [r['mstar_id'] for r in security_master_results]
+        mstar_placeholders = ','.join(['%s'] * len(mstar_ids))
+        latest_as_of_date_query = f"""
+        SELECT mstar_id, MAX(as_of_date) as latest_as_of_date
+        FROM funds_total_return_index
+        WHERE mstar_id IN ({mstar_placeholders})
+          AND as_of_date <= %s
+        GROUP BY mstar_id
+        """
+        
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(latest_as_of_date_query, mstar_ids + [as_of_date])
+                latest_as_of_date_results = cur.fetchall()
+        
+        if not latest_as_of_date_results:
+            logger.error(f"No latest as_of_date found for mstar_ids: {mstar_ids}")
+            return {}
+        
+        # Query 3: Get the actual fund data
+        fund_query = f"""
         SELECT sm.symbol, f.date, f.value
         FROM funds_total_return_index f
-        JOIN latest_as_of_date lad ON f.mstar_id = lad.mstar_id AND f.as_of_date = lad.as_of_date
-        JOIN security_master_data sm ON f.mstar_id = sm.mstar_id
+        JOIN (
+            {security_master_query}
+        ) sm ON f.mstar_id = sm.mstar_id
+        JOIN (
+            {latest_as_of_date_query}
+        ) lad ON f.mstar_id = lad.mstar_id AND f.as_of_date = lad.latest_as_of_date
         WHERE f.date <= %s
         ORDER BY sm.symbol, f.date
         """
         
         with get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(fund_query, (fund_symbols, as_of_date, as_of_date, as_of_date))
+                cur.execute(fund_query, fund_symbols + [as_of_date] + mstar_ids + [as_of_date] + [as_of_date])
                 fund_results = cur.fetchall()
         
         #TODO - This is not efficient. Need to improve performance.
@@ -306,9 +335,14 @@ def portfolio_statistics(account_id: str, as_of_date: str, return_portfolio_deta
 
     return result
 
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
 def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Union[float, Dict]]:
     # Fetch portfolio statistics with return data
-    # TODO - If account holdings has cash as $$$$ then this does not know to fetch VUSXX total return for cash. 
     stats = portfolio_statistics(account_id, as_of_date, return_portfolio_detail=True)
     
     return_data = stats['return_data']
@@ -334,7 +368,7 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
             date.strftime('%Y-%m-%d') if isinstance(date, datetime.date) else str(date): values
             for date, values in data.items()
         }
-
+    
     # Find common date range
     common_dates = list(set.intersection(*[set(data.keys()) for data in return_data.values()]))
     common_dates.sort()
@@ -347,7 +381,12 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
     # Prepare R matrix
     R = []
     for symbol in symbols:
-        R.append([return_data[symbol][date]['return'] for date in common_dates])
+        try:
+            R.append([return_data[symbol][date]['return'] for date in common_dates])
+        except KeyError as e:
+            logger.error(f"KeyError when preparing R matrix for symbol {symbol}: {str(e)}")
+            logger.error(f"Return data for {symbol}: {return_data.get(symbol, 'Not found')}")
+            raise
     R = np.array(R).T
     
     # Prepare k array
@@ -357,6 +396,25 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
     cash_index = len(symbols) - 1  # Cash is always the last index
     
     optimized_portfolios = {}
+    
+    # Simulate balance paths for the original portfolio
+    original_simulation_result = simulate_balance_paths(
+        starting_balance=account_balance,
+        annual_mean=stats['return'],
+        annual_std_dev=stats['volatility'],
+        start_date=as_of_date
+    )
+    
+    # Add simulation results to original_stats
+    stats.update({
+        'percentile_95_balance_path': original_simulation_result['percentile_95_balance_path'].to_dict(),
+        'percentile_5_balance_path': original_simulation_result['percentile_5_balance_path'].to_dict(),
+        'prob_95_percentile': original_simulation_result['prob_95_percentile'],
+        'prob_5_percentile': original_simulation_result['prob_5_percentile'],
+        'final_95_percentile_balance': original_simulation_result['final_95_percentile_balance'],
+        'final_5_percentile_balance': original_simulation_result['final_5_percentile_balance'],
+        'dates': original_simulation_result['dates']
+    })
     
     for cash_target in range(5, 80, 5):
         l = cash_target / 100  # Convert percentage to decimal
@@ -405,7 +463,6 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
             }
         )
         
-        # Simulate balance paths for the optimized portfolio
         simulation_result = simulate_balance_paths(
             starting_balance=account_balance,
             annual_mean=portfolio_stats['return'],
@@ -423,7 +480,6 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
             'portfolio_return': portfolio_stats['return'],
             'portfolio_volatility': portfolio_stats['volatility'],
             'holdings': optimized_holdings,
-            # Add simulation results
             'percentile_95_balance_path': simulation_result['percentile_95_balance_path'].to_dict(),
             'percentile_5_balance_path': simulation_result['percentile_5_balance_path'].to_dict(),
             'prob_95_percentile': simulation_result['prob_95_percentile'],
@@ -433,7 +489,6 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
             'dates': simulation_result['dates']
         }
     
-    # Remove return_data from the original stats
     if 'return_data' in stats:
         del stats['return_data']
 
@@ -441,16 +496,3 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
         'original_stats': stats,
         'optimized_portfolios': optimized_portfolios
     }
-
-# Example usage:
-# optimized_stats = optimized_portfolio_stats('7551d266-f561-4e9f-9fc1-a1faa31af499', '2024-09-07')
-
-# # Write optimized_stats to a JSON file in the @data/temp_debug folder
-# output_folder = '/Users/gokul/Dropbox/Mac/Documents/Personal/Prosper/prosper_backend/data/temp_debug'
-# os.makedirs(output_folder, exist_ok=True)
-# output_file = os.path.join(output_folder, 'optimized_stats.json')
-
-# with open(output_file, 'w') as f:
-#     json.dump(optimized_stats, f, indent=2, default=str)
-
-# print(f"Optimized stats written to {output_file}")
