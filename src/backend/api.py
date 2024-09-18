@@ -31,6 +31,7 @@ import hashlib
 from contextlib import asynccontextmanager
 from fastapi.exceptions import RequestValidationError
 from src.utils.json_utils import CustomJSONEncoder, process_for_json
+from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -581,16 +582,16 @@ def monte_carlo_simulation(
             processed_result = process_for_json(result)
 
             # Write response to JSON file
-            data_dir = Path(__file__).parent.parent.parent / 'data' / 'temp_debug'
-            data_dir.mkdir(exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            file_name = f"monte_carlo_simulation_{account_id}_{timestamp}.json"
-            file_path = data_dir / file_name
+            # data_dir = Path(__file__).parent.parent.parent / 'data' / 'temp_debug'
+            # data_dir.mkdir(exist_ok=True)
+            # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            # file_name = f"monte_carlo_simulation_{account_id}_{timestamp}.json"
+            # file_path = data_dir / file_name
 
-            with open(file_path, 'w') as f:
-                json.dump(processed_result, f, cls=CustomJSONEncoder, indent=2)
+            # with open(file_path, 'w') as f:
+            #     json.dump(processed_result, f, cls=CustomJSONEncoder, indent=2)
 
-            logger.info(f"Monte Carlo simulation result saved to {file_path}")
+            # logger.info(f"Monte Carlo simulation result saved to {file_path}")
 
             # Cache the result
             with conn.cursor() as cur:
@@ -623,6 +624,7 @@ def monte_carlo_simulation(
         raise HTTPException(status_code=500, detail="Error during simulation")
 
 # Add a new endpoint to clear the cache if needed
+# TODO: Investigate if this is needed
 @app.post("/clear-monte-carlo-cache")
 def clear_monte_carlo_cache(
     current_user: str = Depends(get_current_user)
@@ -636,6 +638,42 @@ def clear_monte_carlo_cache(
             return {"message": "Monte Carlo simulation cache cleared"}
         except psycopg.Error as e:
             logger.error(f"Database error while clearing Monte Carlo cache: {str(e)}")
+            raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/tax-rates")
+def get_tax_rates(current_user: str = Depends(get_current_user)):
+    with get_db_connection() as conn:
+        try:
+            with conn.cursor(row_factory=dict_row) as cur:
+                # First, check if tax rates information exists for the user
+                cur.execute("""
+                    SELECT tax_rates_id, federal_income_tax_rate, state_income_tax_rate,
+                           federal_long_term_capital_gains_rate, state_long_term_capital_gains_rate,
+                           as_of_date
+                    FROM tax_rates
+                    WHERE user_id = %s
+                    ORDER BY as_of_date DESC
+                    LIMIT 1
+                """, (current_user,))
+                
+                tax_rates = cur.fetchone()
+
+                if not tax_rates:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Tax rates information not found for this user"
+                    )
+
+                # Convert UUID to string for JSON serialization
+                tax_rates['tax_rates_id'] = str(tax_rates['tax_rates_id'])
+
+                return {
+                    "status": "success",
+                    "tax_rates": tax_rates
+                }
+
+        except psycopg.Error as e:
+            logger.error(f"Database error while fetching tax rates: {str(e)}")
             raise HTTPException(status_code=500, detail="Internal server error")
 
 if __name__ == "__main__":
