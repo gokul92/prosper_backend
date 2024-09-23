@@ -91,9 +91,13 @@ def simulate_balance_paths(starting_balance: float, annual_mean: float, annual_s
     percentile_95_path = balance_paths.quantile(0.95, axis=1)
     percentile_5_path = balance_paths.quantile(0.05, axis=1)
 
+    # Calculate the cross-sectional average across all paths
+    expected_return_path = balance_paths.mean(axis=1)
+
     # Calculate probabilities
     one_year_index = min(252, len(balance_paths) - 1)  # Ensure we don't go out of bounds
     one_year_balances = balance_paths.iloc[one_year_index]
+    one_year_expected_return = expected_return_path.iloc[one_year_index]
     
     # Probability that balance will be greater than current balance
     prob_greater_than_starting = (one_year_balances > starting_balance).mean()
@@ -109,6 +113,9 @@ def simulate_balance_paths(starting_balance: float, annual_mean: float, annual_s
     
     # Probability that balance will be lower than current balance but greater than 5th percentile
     prob_between_5_and_starting = ((one_year_balances < starting_balance) & (one_year_balances > percentile_5_balance)).mean()
+
+    # Probability that balance will be greater than current balance but lower than expected return
+    prob_between_starting_and_expected = ((one_year_balances > starting_balance) & (one_year_balances < one_year_expected_return)).mean()
 
     # Convert index to datetime for resampling
     balance_paths.index = pd.to_datetime(balance_paths.index)
@@ -126,10 +133,21 @@ def simulate_balance_paths(starting_balance: float, annual_mean: float, annual_s
     percentile_95_path_monthly = pd.concat([pd.Series({start_date_ts: starting_balance}), percentile_95_path_monthly])
     percentile_5_path_monthly = pd.concat([pd.Series({start_date_ts: starting_balance}), percentile_5_path_monthly])
 
+    # Ensure expected_return_path has a DatetimeIndex
+    if not isinstance(expected_return_path.index, pd.DatetimeIndex):
+        expected_return_path.index = pd.to_datetime(expected_return_path.index)
+
+    # Resample expected return path to monthly frequency
+    expected_return_path_monthly = expected_return_path.resample('ME').last()
+
+    # Add start_date and starting_balance as the first data point to monthly objects
+    expected_return_path_monthly = pd.concat([pd.Series({start_date_ts: starting_balance}), expected_return_path_monthly])
+
     # Convert to strings
     balance_paths_monthly.index = balance_paths_monthly.index.strftime('%Y-%m-%d')
     percentile_95_path_monthly.index = percentile_95_path_monthly.index.strftime('%Y-%m-%d')
     percentile_5_path_monthly.index = percentile_5_path_monthly.index.strftime('%Y-%m-%d')
+    expected_return_path_monthly.index = expected_return_path_monthly.index.strftime('%Y-%m-%d')
 
     # Extract dates from the index
     dates = balance_paths_monthly.index.tolist()
@@ -149,7 +167,10 @@ def simulate_balance_paths(starting_balance: float, annual_mean: float, annual_s
         "prob_between_starting_and_95": prob_between_starting_and_95,
         "prob_between_5_and_starting": prob_between_5_and_starting,
         "percentile_95_balance_1y": percentile_95_balance,
-        "percentile_5_balance_1y": percentile_5_balance
+        "percentile_5_balance_1y": percentile_5_balance,
+        "expected_return_path": expected_return_path_monthly,
+        "prob_between_starting_and_expected": prob_between_starting_and_expected,
+        "final_expected_return_balance": expected_return_path_monthly.iloc[-1],
     }
 
     return result

@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple, Union
+from typing import List, Dict, Tuple, Union, Any
 import psycopg
 from psycopg.rows import dict_row
 import os
@@ -11,6 +11,7 @@ import datetime
 from src.domain_logic.optimization import PortfolioOptimizer
 from src.domain_logic.simulation import simulate_balance_paths
 from contextlib import contextmanager
+from src.domain_logic.optimization import TaxOptimizer
 
 load_dotenv()
 
@@ -39,6 +40,7 @@ def fetch_account_data(account_id: str, as_of_date: str) -> Dict:
         GROUP BY account_id
     )
     SELECT ah.symbol, ah.quantity, ah.adjusted_cost_basis, ah.as_of_date,
+           ah.purchase_date, ah.capital_gains_type,
            sm.security_type, sm.mstar_id,
            CASE
                WHEN sm.security_type = 'Equity' THEN eph.close_price
@@ -271,6 +273,23 @@ def calculate_portfolio_volatility(weights: Dict[str, Dict[str, float]], covaria
     portfolio_variance = weight_array.T @ annualized_cov_matrix @ weight_array
     return np.sqrt(portfolio_variance)
 
+def aggregate_holdings(holdings: List[Dict]) -> List[Dict]:
+    aggregated = {}
+    for holding in holdings:
+        symbol = holding['symbol']
+        if symbol not in aggregated:
+            aggregated[symbol] = holding.copy()
+            aggregated[symbol]['total_cost'] = holding['quantity'] * holding['adjusted_cost_basis']
+        else:
+            aggregated[symbol]['quantity'] += holding['quantity']
+            aggregated[symbol]['total_cost'] += holding['quantity'] * holding['adjusted_cost_basis']
+    
+    for symbol, data in aggregated.items():
+        data['adjusted_cost_basis'] = data['total_cost'] / data['quantity']
+        del data['total_cost']
+    
+    return list(aggregated.values())
+
 def portfolio_statistics(account_id: str, as_of_date: str, return_portfolio_detail: bool = False, data: Dict = None) -> Dict[str, Union[float, Dict]]:
     if account_id == '':
         if not data or not isinstance(data, dict):
@@ -285,11 +304,18 @@ def portfolio_statistics(account_id: str, as_of_date: str, return_portfolio_deta
         weights = data['weights']
         return_data = data['return_data']
         
+        # Aggregate holdings if not already aggregated
+        if any(h1['symbol'] == h2['symbol'] for h1 in holdings for h2 in holdings if h1 != h2):
+            holdings = aggregate_holdings(holdings)
+        
         # Convert nested dictionary return_data back to DataFrame
         return_data = {symbol: pd.DataFrame.from_dict(data, orient='index') for symbol, data in return_data.items()}
     else:
         # Fetch all account data in one query
-        holdings = fetch_account_data(account_id, as_of_date)
+        raw_holdings = fetch_account_data(account_id, as_of_date)
+        
+        # Aggregate holdings
+        holdings = aggregate_holdings(raw_holdings)
 
         # Calculate symbol weights and get individual returns and volatilities
         weights, account_balance = calculate_symbol_weights(holdings)
@@ -341,7 +367,7 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Union[float, Dict]]:
+def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Union[float, Dict]]:    
     # Fetch portfolio statistics with return data
     stats = portfolio_statistics(account_id, as_of_date, return_portfolio_detail=True)
     
@@ -418,7 +444,10 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
         'prob_between_starting_and_95': original_simulation_result['prob_between_starting_and_95'],
         'prob_between_5_and_starting': original_simulation_result['prob_between_5_and_starting'],
         'percentile_95_balance_1y': original_simulation_result['percentile_95_balance_1y'],
-        'percentile_5_balance_1y': original_simulation_result['percentile_5_balance_1y']
+        'percentile_5_balance_1y': original_simulation_result['percentile_5_balance_1y'],
+        'expected_return_path': original_simulation_result['expected_return_path'].to_dict(),
+        'prob_between_starting_and_expected': original_simulation_result['prob_between_starting_and_expected'],
+        'final_expected_return_balance': original_simulation_result['final_expected_return_balance']
     })
     
     for cash_target in range(5, 80, 5):
@@ -496,7 +525,10 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
             'prob_between_starting_and_95': simulation_result['prob_between_starting_and_95'],
             'prob_between_5_and_starting': simulation_result['prob_between_5_and_starting'],
             'percentile_95_balance_1y': simulation_result['percentile_95_balance_1y'],
-            'percentile_5_balance_1y': simulation_result['percentile_5_balance_1y']
+            'percentile_5_balance_1y': simulation_result['percentile_5_balance_1y'],
+            'expected_return_path': simulation_result['expected_return_path'].to_dict(),
+            'prob_between_starting_and_expected': simulation_result['prob_between_starting_and_expected'],
+            'final_expected_return_balance': simulation_result['final_expected_return_balance']
         }
     
     if 'return_data' in stats:
@@ -505,4 +537,257 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
     return {
         'original_stats': stats,
         'optimized_portfolios': optimized_portfolios
+    }
+
+def tax_optimized_rebalance(
+    optimized_portfolio: Dict[str, Any],
+    original_portfolio: Dict[str, Any],
+    short_term_tax_rate: float,
+    long_term_tax_rate: float
+) -> Dict[str, Any]:
+    trades = {}
+    cash_delta = 0.0
+
+    # Helper function to extract symbol from tax lot ID
+    def extract_symbol(tax_lot_id: str) -> str:
+        # Assuming tax_lot_id format is 'SYMBOL_DATE_COSTBASIS_OTHERINFO'
+        return tax_lot_id.split('_')[0]
+
+    # Group original portfolio tax lots by symbol
+    original_portfolio_by_symbol = {}
+    for tax_lot_id, data in original_portfolio.items():
+        symbol = extract_symbol(tax_lot_id)
+        if symbol not in original_portfolio_by_symbol:
+            original_portfolio_by_symbol[symbol] = {
+                'tax_lots': {},
+                'total_shares': 0.0,
+                'weight': 0.0,
+                'current_price': data['current_price'],
+                'security_type': data['security_type'],
+                'current_price_as_of_date': data['current_price_as_of_date'],
+                'as_of_date': data['as_of_date']
+            }
+        original_portfolio_by_symbol[symbol]['tax_lots'][tax_lot_id] = data
+        shares_in_lot = sum(data.get('shares', []))
+        original_portfolio_by_symbol[symbol]['total_shares'] += shares_in_lot
+        original_portfolio_by_symbol[symbol]['weight'] += data.get('weight', 0.0)
+
+    # Group optimized portfolio data by symbol
+    optimized_portfolio_by_symbol = {}
+    for symbol, data in optimized_portfolio.items():
+        optimized_portfolio_by_symbol[symbol] = {
+            'total_shares': data.get('shares', 0.0),
+            'weight': data.get('weight', 0.0),
+            'current_price': data.get('current_price'),
+            'security_type': data.get('security_type'),
+            'current_price_as_of_date': data.get('current_price_as_of_date'),
+            'as_of_date': data.get('as_of_date')
+        }
+
+    # Process each symbol to calculate trades and cash delta
+    all_symbols = set(original_portfolio_by_symbol.keys()).union(optimized_portfolio_by_symbol.keys())
+
+    # Dictionary to keep track of optimized shares for each symbol
+    optimized_shares = {}
+
+    for symbol in all_symbols:
+        original_data = original_portfolio_by_symbol.get(symbol, {
+            'tax_lots': {},
+            'total_shares': 0.0,
+            'weight': 0.0,
+            'current_price': None,
+            'security_type': None,
+            'current_price_as_of_date': None,
+            'as_of_date': None
+        })
+        optimized_data = optimized_portfolio_by_symbol.get(symbol, {
+            'total_shares': 0.0,
+            'weight': 0.0,
+            'current_price': None,
+            'security_type': None,
+            'current_price_as_of_date': None,
+            'as_of_date': None
+        })
+
+        # Use data from either portfolio to fill in missing information
+        current_price = optimized_data['current_price'] or original_data['current_price']
+        security_type = optimized_data['security_type'] or original_data['security_type']
+        current_price_as_of_date = optimized_data['current_price_as_of_date'] or original_data['current_price_as_of_date']
+        as_of_date_str = optimized_data['as_of_date'] or original_data['as_of_date']
+        as_of_date = datetime.datetime.strptime(as_of_date_str, '%Y-%m-%d').date() if as_of_date_str else datetime.date.today()
+
+        weight_in_original = original_data['weight']
+        weight_in_optimized = optimized_data['weight']
+        shares_in_original = original_data['total_shares']
+        shares_in_optimized = optimized_data['total_shares']
+
+        delta_shares = shares_in_optimized - shares_in_original
+        cash_delta -= delta_shares * current_price  # Update cash position
+
+        optimized_shares[symbol] = shares_in_optimized  # Keep track of optimized shares
+
+        tax_lots = {}
+        total_taxes = 0.0  # To accumulate total taxes for this symbol
+
+        if delta_shares < 0:  # Selling shares
+            total_shares_to_sell = abs(delta_shares)
+            # Prepare data for TaxOptimizer
+            s = current_price
+            q_m = []
+            c = []
+            r = []
+            tax_lot_ids = []
+            lot_shares_list = []
+
+            # Iterate over each tax lot
+            for tax_lot_id, lot_data in original_data['tax_lots'].items():
+                shares_list = lot_data.get('shares', [])
+                cost_basis_list = lot_data.get('adjusted_cost_basis', [])
+                purchase_dates_list = lot_data.get('purchase_date', [])
+                capital_gains_types_list = lot_data.get('capital_gains_type', [])
+
+                # Ensure lists are of same length
+                num_entries = len(shares_list)
+                cost_basis_list = cost_basis_list[:num_entries]
+                purchase_dates_list = purchase_dates_list[:num_entries]
+                capital_gains_types_list = capital_gains_types_list[:num_entries]
+
+                for i in range(num_entries):
+                    shares = shares_list[i]
+                    cost_basis = cost_basis_list[i]
+                    purchase_date = purchase_dates_list[i] if i < len(purchase_dates_list) else None
+                    capital_gains_type = capital_gains_types_list[i] if i < len(capital_gains_types_list) else None
+
+                    # Determine the tax rate r
+                    if purchase_date:
+                        if isinstance(purchase_date, str):
+                            try:
+                                purchase_date_dt = datetime.datetime.strptime(purchase_date, '%Y-%m-%d').date()
+                            except ValueError:
+                                raise ValueError(f"Invalid purchase_date format for tax lot {tax_lot_id}: {purchase_date}")
+                        else:
+                            purchase_date_dt = purchase_date
+                        days_held = (as_of_date - purchase_date_dt).days
+                        if days_held > 365:
+                            tax_rate = long_term_tax_rate
+                        else:
+                            tax_rate = short_term_tax_rate
+                    elif capital_gains_type:
+                        if capital_gains_type == 'lt':
+                            tax_rate = long_term_tax_rate
+                        elif capital_gains_type == 'st':
+                            tax_rate = short_term_tax_rate
+                        else:
+                            raise ValueError(f"Invalid capital_gains_type '{capital_gains_type}' for tax lot {tax_lot_id}")
+                    else:
+                        raise ValueError(f"Missing capital_gains_type and purchase_date for tax lot {tax_lot_id}")
+
+                    q_m.append(shares)
+                    c.append(cost_basis)
+                    r.append(tax_rate)
+                    tax_lot_ids.append(tax_lot_id)
+                    lot_shares_list.append(shares)
+
+            q = sum(q_m)
+            delta = total_shares_to_sell
+
+            # Ensure all arrays are numpy arrays
+            q_m = np.array(q_m)
+            c = np.array(c)
+            r = np.array(r)
+
+            # Initialize TaxOptimizer
+            tax_optimizer = TaxOptimizer(delta=delta, s=s, c=c, r=r, q=q, q_m=q_m)
+            optimal_fractions, optimization_result = tax_optimizer.optimize()
+
+            if not optimization_result.success:
+                raise ValueError(f"Tax optimization failed for symbol {symbol}: {optimization_result.message}")
+
+            # Compute shares to sell from each lot
+            shares_to_sell_per_lot = optimal_fractions * q_m
+            # Compute taxes incurred from each lot
+            taxes_per_lot = shares_to_sell_per_lot * (s - c) * r
+            total_taxes = np.sum(taxes_per_lot)
+
+            # Build tax_lot entries
+            for i, (tax_lot_id, shares_to_sell, lot_shares, cost_basis, tax_incurred) in enumerate(zip(tax_lot_ids, shares_to_sell_per_lot, lot_shares_list, c, taxes_per_lot)):
+                if shares_to_sell > 0:
+                    tax_lots[tax_lot_id] = {
+                        "adjusted_cost_basis": cost_basis,
+                        "number_of_shares_in_original_portfolio": lot_shares,
+                        "number_of_shares_in_optimized_portfolio": lot_shares - shares_to_sell,
+                        "number_of_shares_traded": -shares_to_sell,
+                        "taxes_incurred": tax_incurred
+                    }
+
+        elif delta_shares > 0:  # Buying shares
+            # Create a new tax lot
+            tax_lot_id = f"{symbol}_{as_of_date_str}_{current_price}_new"
+            tax_lots[tax_lot_id] = {
+                "adjusted_cost_basis": current_price,
+                "number_of_shares_in_original_portfolio": 0.0,
+                "number_of_shares_in_optimized_portfolio": delta_shares,
+                "number_of_shares_traded": delta_shares,
+                "taxes_incurred": 0.0  # No taxes incurred when buying
+            }
+
+        else:
+            continue  # No trades required
+
+        # Build the trades entry for the symbol
+        trades[symbol] = {
+            "symbol": symbol,
+            "current_price": current_price,
+            "security_type": security_type,
+            "current_price_as_of_date": current_price_as_of_date,
+            "as_of_date": as_of_date_str,
+            "weight_in_original_portfolio": weight_in_original,
+            "weight_in_optimized_portfolio": weight_in_optimized,  # Will update later
+            "number_of_shares_traded": delta_shares,
+            "tax_lots": tax_lots
+        }
+        if delta_shares < 0:
+            trades[symbol]["taxes_incurred"] = total_taxes
+
+    # Handle cash
+    cash_symbol = '$$$$'
+    cash_original = original_portfolio.get(cash_symbol, {})
+    cash_shares_original = cash_original.get('total_shares', 0.0)
+    cash_shares_optimized = cash_shares_original + cash_delta  # Updated cash position
+
+    optimized_shares[cash_symbol] = cash_shares_optimized  # Keep track of optimized cash shares
+
+    # Calculate total optimized portfolio value
+    total_optimized_value = 0.0
+    for symbol, shares in optimized_shares.items():
+        price = optimized_portfolio_by_symbol.get(symbol, {}).get('current_price', 1.0)  # Default price for cash is 1.0
+        total_optimized_value += shares * price
+
+    # Update 'weight_in_optimized_portfolio' for each symbol
+    for symbol, trade_data in trades.items():
+        shares = optimized_shares.get(symbol, 0.0)
+        price = trade_data['current_price']
+        position_value = shares * price
+        weight_in_optimized = position_value / total_optimized_value if total_optimized_value != 0 else 0.0
+        trade_data['weight_in_optimized_portfolio'] = weight_in_optimized
+
+    # Update cash position in trades with recalculated weight
+    cash_position_value = optimized_shares[cash_symbol]  # cash_shares_optimized
+    weight_in_original_cash = cash_original.get('weight', 0.0)
+    weight_in_optimized_cash = cash_position_value / total_optimized_value if total_optimized_value != 0 else 0.0
+    trades[cash_symbol] = {
+        "symbol": cash_symbol,
+        "current_price": 1.0,
+        "security_type": "MMF",
+        "current_price_as_of_date": cash_original.get('current_price_as_of_date', ''),
+        "as_of_date": cash_original.get('as_of_date', ''),
+        "weight_in_original_portfolio": weight_in_original_cash,
+        "weight_in_optimized_portfolio": weight_in_optimized_cash,
+        "number_of_shares_traded": cash_delta,
+        "tax_lots": {}
+    }
+
+    return {
+        "status": "success",
+        "tax_optimal_trades": trades
     }

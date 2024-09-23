@@ -3,11 +3,10 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt
 from jose.exceptions import JWTError
 from pydantic import BaseModel, UUID4, validator, Field, EmailStr
-from typing import Dict, List
+from typing import Any, Dict, List
 import requests
 import os
 import psycopg
-from datetime import date
 from dotenv import load_dotenv
 from datetime import date, datetime
 from uuid import uuid4
@@ -20,19 +19,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg.rows import dict_row
 from ..utils.validators import validate_payload
-from ..utils.calcs import portfolio_statistics, optimized_portfolio_stats
+from ..utils.calcs import portfolio_statistics, optimized_portfolio_stats, tax_optimized_rebalance, fetch_account_data
 from ..domain_logic.tax_rates_calc import IncomeTaxRates
 import json
 from contextlib import asynccontextmanager
-from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime
 from functools import lru_cache
 import hashlib
 from contextlib import asynccontextmanager
 from fastapi.exceptions import RequestValidationError
 from src.utils.json_utils import CustomJSONEncoder, process_for_json
 from uuid import UUID
-
+import math
+from collections import defaultdict
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -173,7 +172,7 @@ def get_db_connection():
     finally:
         conn.close()
 
-
+#TODO - add account number to the account create
 @app.post("/create-account")
 def create_account(
     account: AccountCreate,
@@ -215,22 +214,27 @@ def create_account(
         except psycopg.Error as e:
             conn.rollback()
             logger.error(f"Database error while creating account: {str(e)}")
-            raise HTTPException(status_code=500, detail="Internal server error")
+            raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
         return {
             "status": "success",
             "message": "Account created successfully",
-            "account_id": account_id,
+            "account_id": str(account_id),  # Convert UUID to string for JSON response
             "as_of_date": as_of_date,
         }
 
 
-# New endpoint for adding account holdings
 class AccountHolding(BaseModel):
     symbol: str
     quantity: float
     adjusted_cost_basis: float
     as_of_date: date = None
+    purchase_date: date = None
+    capital_gains_type: str = None
+    total_cost: float = None
+    security_type: str = None
+    cusip: str = None
+    mstar_id: str = None
 
     @validator("quantity")
     def quantity_must_be_positive(cls, v):
@@ -238,67 +242,126 @@ class AccountHolding(BaseModel):
             raise ValueError("Quantity must be greater than 0")
         return v
 
+    @validator("capital_gains_type")
+    def validate_capital_gains_type(cls, v):
+        if v is not None and v not in ["lt", "st"]:
+            raise ValueError("Capital gains type must be either 'lt' or 'st'")
+        return v
+
+    @validator("purchase_date")
+    def validate_purchase_date(cls, v, values):
+        if v is not None and "as_of_date" in values and values["as_of_date"] is not None:
+            if v > values["as_of_date"]:
+                raise ValueError("Purchase date cannot be after as_of_date")
+        return v
+
+    @validator("total_cost")
+    def validate_total_cost(cls, v, values):
+        if v is not None:
+            if v <= 0:
+                raise ValueError("Total cost must be greater than 0")
+            if "quantity" in values and "adjusted_cost_basis" in values:
+                expected_total_cost = values["quantity"] * values["adjusted_cost_basis"]
+                if not math.isclose(v, expected_total_cost, rel_tol=0.05):
+                    raise ValueError("Total cost should be to within 5% of quantity * adjusted_cost_basis")
+        return v
 
 class AccountHoldingsCreate(BaseModel):
     account_id: UUID4
     holdings: List[AccountHolding]
 
+import logging
+from fastapi import HTTPException, Depends
+from pydantic import ValidationError
+
+logger = logging.getLogger(__name__)
 
 @app.post("/add-account-holdings")
 def add_account_holdings(
     holdings_data: AccountHoldingsCreate,
     current_user: str = Depends(get_current_user)
 ):
+    logger.info(f"Received request to add holdings for account: {holdings_data.account_id}")
+    logger.debug(f"Holdings data: {holdings_data.dict()}")
+
     with get_db_connection() as conn:
         try:
             with conn.cursor(row_factory=dict_row) as cur:
                 # Check if the account exists and belongs to the current user
+                logger.debug(f"Checking if account exists for user: {current_user}")
                 cur.execute(
                     "SELECT 1 FROM accounts WHERE account_id = %s AND user_id = %s",
-                    (holdings_data.account_id, current_user),
+                    (holdings_data.account_id, current_user)
                 )
                 if cur.fetchone() is None:
+                    logger.warning(f"Account not found or doesn't belong to user. Account ID: {holdings_data.account_id}, User ID: {current_user}")
                     raise HTTPException(
                         status_code=404,
-                        detail="Account not found or doesn't belong to the current user",
+                        detail=f"Account not found or doesn't belong to the current user. Account ID: {holdings_data.account_id}, User ID: {current_user}",
                     )
 
-                # Validate symbols against security_master
-                symbols = [holding.symbol for holding in holdings_data.holdings]
-                cur.execute(
-                    """
-                    SELECT DISTINCT ON (symbol)
-                        symbol,
-                        security_type,
-                        security_name
+                logger.debug("Account found, proceeding with holdings validation")
+
+                # Validate symbols against security_master and adjust as_of_date
+                for holding in holdings_data.holdings:
+                    logger.debug(f"Validating holding: {holding.dict()}")
+
+                    # Set default as_of_date if not provided
+                    holding_as_of_date = holding.as_of_date or date.today()
+
+                    query = """
+                    SELECT 
+                        symbol, 
+                        security_type, 
+                        security_name, 
+                        cusip, 
+                        mstar_id,
+                        as_of_date
                     FROM security_master
-                    WHERE symbol = ANY(%s)
-                    ORDER BY symbol, CASE 
-                        WHEN security_type != 'Equity' THEN 0
-                        ELSE 1
-                    END, as_of_date DESC
-                """,
-                    (symbols,),
-                )
-                validated_symbols = cur.fetchall()
+                    WHERE symbol = %s
+                    """
+                    params = [holding.symbol]
 
-                unknown_symbols = [
-                    symbol
-                    for symbol in symbols
-                    if symbol not in [vs["symbol"] for vs in validated_symbols]
-                ]
+                    if holding.security_type:
+                        query += " AND security_type = %s"
+                        params.append(holding.security_type)
+                    if holding.cusip:
+                        query += " AND cusip = %s"
+                        params.append(holding.cusip)
 
-                if unknown_symbols:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Unknown symbols: {', '.join(unknown_symbols)}",
-                    )
+                    query += " AND as_of_date <= %s"
+                    params.append(holding_as_of_date)
+
+                    query += " ORDER BY as_of_date DESC LIMIT 1"
+
+                    logger.debug(f"Executing query: {query} with params: {params}")
+                    cur.execute(query, params)
+                    security = cur.fetchone()
+
+                    if not security:
+                        logger.warning(f"Invalid symbol, security_type, or cusip combination or no matching as_of_date for symbol: {holding.symbol}")
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Invalid symbol, security_type, or cusip combination or no matching as_of_date for symbol: {holding.symbol}"
+                        )
+
+                    logger.debug(f"Security found: {security}")
+                    # Update holding with fetched data
+                    holding.security_type = security['security_type']
+                    holding.cusip = security['cusip']
+                    if 'mstar_id' in security:
+                        holding.mstar_id = security['mstar_id']
+                    # Use the as_of_date from security_master to satisfy foreign key constraint
+                    holding.as_of_date = security['as_of_date']
+
+                logger.debug("All holdings validated, preparing for insertion")
 
                 # Prepare the query for inserting multiple holdings
                 insert_query = """
                     INSERT INTO account_holdings 
-                    (account_id, symbol, quantity, adjusted_cost_basis, as_of_date)
-                    VALUES (%s, %s, %s, %s, COALESCE(%s, CURRENT_DATE))
+                    (account_id, symbol, quantity, adjusted_cost_basis, as_of_date, 
+                     purchase_date, capital_gains_type, total_cost, security_type, cusip, mstar_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
 
                 # Prepare the data for bulk insert
@@ -309,40 +372,54 @@ def add_account_holdings(
                         holding.quantity,
                         holding.adjusted_cost_basis,
                         holding.as_of_date,
+                        holding.purchase_date,
+                        holding.capital_gains_type,
+                        holding.total_cost,
+                        holding.security_type,
+                        holding.cusip,
+                        holding.mstar_id
                     )
                     for holding in holdings_data.holdings
                 ]
 
-                # Execute the bulk insert
-                cur.executemany(insert_query, insert_data)
+                logger.debug(f"Executing bulk insert with {len(insert_data)} holdings")
+                logger.debug(f"Insert query: {insert_query}")
+                logger.debug(f"Insert data: {insert_data}")
+                
+                try:
+                    # Execute the bulk insert
+                    cur.executemany(insert_query, insert_data)
+                except psycopg.errors.ForeignKeyViolation as e:
+                    logger.error(f"Foreign key violation during bulk insert: {str(e)}")
+                    raise HTTPException(status_code=400, detail=f"Foreign key violation: {str(e)}")
+                except psycopg.Error as e:
+                    logger.error(f"Database error during bulk insert: {str(e)}")
+                    raise HTTPException(status_code=500, detail=f"Database error during bulk insert: {str(e)}")
 
             conn.commit()
-        except HTTPException:
-            conn.rollback()
-            raise
+            logger.info(f"Successfully added {len(holdings_data.holdings)} holdings to account {holdings_data.account_id}")
+        except HTTPException as http_exc:
+            logger.exception("HTTP exception occurred")
+            raise http_exc
         except psycopg_errors.ForeignKeyViolation:
-            conn.rollback()
             raise HTTPException(status_code=400, detail="Invalid account ID")
         except psycopg_errors.CheckViolation as e:
-            conn.rollback()
             raise HTTPException(status_code=400, detail=f"Constraint violation: {str(e)}")
         except psycopg_errors.UniqueViolation:
-            conn.rollback()
             raise HTTPException(
                 status_code=409, detail="Duplicate entry for account holdings"
             )
-        except psycopg_errors.NotNullViolation:
-            conn.rollback()
-            raise HTTPException(status_code=400, detail="Missing required fields")
+        except psycopg_errors.NotNullViolation as e:
+            raise HTTPException(status_code=400, detail=f"Missing required field: {str(e)}")
         except psycopg.Error as e:
             conn.rollback()
-            logger.error(f"Database error while adding account holdings: {str(e)}")
-            raise HTTPException(status_code=500, detail="Internal server error")
+            logger.exception(f"Database error while adding account holdings: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-        return {
-            "status": "success",
-            "message": f"Added {len(holdings_data.holdings)} holdings to the account",
-        }
+    return {
+        "status": "success",
+        "message": f"Added {len(holdings_data.holdings)} holdings to the account",
+    }
 
 
 # New endpoint for receiving tax rates information
@@ -675,6 +752,201 @@ def get_tax_rates(current_user: str = Depends(get_current_user)):
         except psycopg.Error as e:
             logger.error(f"Database error while fetching tax rates: {str(e)}")
             raise HTTPException(status_code=500, detail="Internal server error")
+        
+# Define the Pydantic model for the request body
+class OptimizeTaxesRequest(BaseModel):
+    account_id: UUID4
+    optimized_portfolio: Dict[str, Any]
 
+# Add the following helper function to fetch tax rates
+def fetch_user_tax_rates(user_id: str, target_date: date, conn: psycopg.Connection) -> Dict:
+    with conn.cursor(row_factory=dict_row) as cur:
+        # Fetch the most recent tax rates on or before the target_date
+        cur.execute("""
+            SELECT federal_income_tax_rate, state_income_tax_rate,
+                   federal_long_term_capital_gains_rate, state_long_term_capital_gains_rate
+            FROM tax_rates
+            WHERE user_id = %s AND as_of_date <= %s
+            ORDER BY as_of_date DESC
+            LIMIT 1
+        """, (user_id, target_date))
+        tax_rates = cur.fetchone()
+        if not tax_rates:
+            raise HTTPException(status_code=404, detail="Tax rates not found for the user on or before the specified date")
+        return tax_rates
+
+@app.post("/optimize-taxes")
+def optimize_taxes(
+    request: OptimizeTaxesRequest,
+    current_user: str = Depends(get_current_user)
+):
+    logger.info(f"Received optimize taxes request for account: {request.account_id}")
+    logger.debug(f"Request data: {request.model_dump()}")
+
+    account_id = str(request.account_id)
+    as_of_date = date.today()
+
+    with get_db_connection() as conn:
+        # Validate that the account belongs to the current user
+        if not validate_account_id(account_id, current_user, conn):
+            logger.warning(f"Account not found or doesn't belong to user. Account ID: {account_id}, User ID: {current_user}")
+            raise HTTPException(
+                status_code=404,
+                detail="Account not found or doesn't belong to the current user"
+            )
+
+        # Fetch the appropriate tax rates for the user
+        tax_rates = fetch_user_tax_rates(current_user, as_of_date, conn)
+
+        # Extract short-term and long-term federal tax rates
+        short_term_tax_rate = tax_rates['federal_income_tax_rate']
+        long_term_tax_rate = tax_rates['federal_long_term_capital_gains_rate']
+
+        # Get the current holdings using the fetch_account_data function
+        holdings = fetch_account_data(account_id, as_of_date.isoformat())
+
+        logger.info(f"Holdings: {holdings}")
+
+        if not holdings:
+            logger.warning(f"No holdings found for account {account_id} on {as_of_date}")
+            raise HTTPException(status_code=404, detail="No holdings found for this account on the latest date")
+
+        # Organize holdings by symbol
+        portfolio_by_symbol = defaultdict(list)
+        for holding in holdings:
+            portfolio_by_symbol[holding['symbol']].append(holding)
+
+        # Prepare the original_portfolio data structure
+        original_portfolio = {}
+
+        for symbol, symbol_holdings in portfolio_by_symbol.items():
+            for holding in symbol_holdings:
+                adjusted_cost_basis = holding['adjusted_cost_basis']
+                purchase_date = holding.get('purchase_date')
+                capital_gains_type = holding.get('capital_gains_type')
+                as_of_date_holding = holding['as_of_date']
+                security_type = holding['security_type']
+                shares = holding['quantity']
+                mstar_id = holding.get('mstar_id')
+
+                # Retrieve the price from optimized_portfolio's holdings
+                optimized_holding = next(
+                    (item for item in request.optimized_portfolio.get('holdings', []) if item['symbol'] == symbol),
+                    None
+                )
+
+                if not optimized_holding:
+                    logger.error(f"Price for symbol {symbol} not found in optimized_portfolio")
+                    raise HTTPException(status_code=400, detail=f"Price for symbol {symbol} not provided in optimized_portfolio")
+
+                current_price = optimized_holding.get('latest_market_price')
+
+                if current_price is None:
+                    logger.error(f"Latest market price for symbol {symbol} is missing in optimized_portfolio")
+                    raise HTTPException(status_code=400, detail=f"Latest market price for symbol {symbol} is missing in optimized_portfolio")
+
+                total_value = shares * current_price
+                account_balance = request.optimized_portfolio.get('account_balance', 1.0)
+                weight = total_value / account_balance if account_balance > 0 else 0.0
+
+                # Convert dates to strings if necessary
+                if isinstance(purchase_date, date):
+                    purchase_date_str = purchase_date.isoformat()
+                else:
+                    purchase_date_str = purchase_date  # Assuming it's already a string or None
+
+                if isinstance(as_of_date_holding, date):
+                    as_of_date_holding_str = as_of_date_holding.isoformat()
+                else:
+                    as_of_date_holding_str = as_of_date_holding  # Assuming it's already a string
+
+                # Unique identifier for each tax lot
+                tax_lot_id = f"{symbol}_{purchase_date_str}_{adjusted_cost_basis}_{as_of_date_holding_str}"
+
+                # Initialize the tax lot entry if it doesn't exist
+                if tax_lot_id not in original_portfolio:
+                    original_portfolio[tax_lot_id] = {
+                        'symbol': symbol,
+                        'weight': 0.0,  # Will be updated later
+                        'security_type': security_type,
+                        'current_price': current_price,
+                        'current_price_as_of_date': as_of_date_holding_str,
+                        'as_of_date': as_of_date.isoformat(),
+                        'shares': [],
+                        'adjusted_cost_basis': [],
+                        'purchase_date': [],
+                        'capital_gains_type': [],
+                        'mstar_id': mstar_id
+                    }
+
+                # Append data to the lists
+                original_portfolio[tax_lot_id]['shares'].append(shares)
+                original_portfolio[tax_lot_id]['adjusted_cost_basis'].append(adjusted_cost_basis)
+                original_portfolio[tax_lot_id]['purchase_date'].append(purchase_date_str)
+                original_portfolio[tax_lot_id]['capital_gains_type'].append(capital_gains_type)
+
+        # After building original_portfolio, calculate weights
+        account_balance = sum(
+            h['quantity'] * h.get('price', 0.0) for h in holdings if h.get('price', 0.0) > 0
+        )
+
+        for tax_lot_id, data in original_portfolio.items():
+            total_value = sum(data['shares']) * data['current_price']
+            weight = total_value / account_balance if account_balance > 0 else 0.0
+            original_portfolio[tax_lot_id]['weight'] = weight
+
+        # Prepare the optimized_portfolio data structure
+        optimized_portfolio = {}
+
+        for holding in request.optimized_portfolio.get('holdings', []):
+            symbol = holding['symbol']
+            current_price = holding.get('latest_market_price')
+            shares = holding.get('shares', 0.0)
+            security_type = holding.get('security_type', 'Unknown')
+            mstar_id = holding.get('mstar_id')
+            adjusted_cost_basis = holding.get('adjusted_cost_basis', current_price)
+
+            total_value = shares * current_price
+            weight = total_value / account_balance if account_balance > 0 else 0.0
+
+            optimized_portfolio[symbol] = {
+                'symbol': symbol,
+                'weight': weight,
+                'security_type': security_type,
+                'current_price': current_price,
+                'current_price_as_of_date': as_of_date.isoformat(),
+                'as_of_date': as_of_date.isoformat(),
+                'shares': shares,
+                'mstar_id': mstar_id,
+                'adjusted_cost_basis': adjusted_cost_basis  # Optional, for new purchases
+            }
+
+        try:
+            # Call the tax_optimized_rebalance function with the prepared data and tax rates
+            result = tax_optimized_rebalance(
+                optimized_portfolio=optimized_portfolio,
+                original_portfolio=original_portfolio,
+                short_term_tax_rate=short_term_tax_rate,
+                long_term_tax_rate=long_term_tax_rate
+            )
+
+            # Return the result with a success status
+            logger.info(f"Successfully optimized taxes for account {account_id}")
+            return {
+                'status': 'success',
+                'tax_optimal_trades': result['tax_optimal_trades']
+            }
+        except ValueError as e:
+            # Handle expected errors from input validation
+            logger.error(f"ValueError during tax optimized rebalance: {str(e)}")
+            raise HTTPException(status_code=400, detail=str(e))
+        except HTTPException as http_exc:
+            logger.exception(f"HTTPException occurred: {http_exc.detail}")
+            raise http_exc
+        except Exception as e:
+            # Log unexpected errors and return a generic internal server error
+            logger.exception(f"Unexpected error during tax optimized rebalance: {str(e)}")
+            raise HTTPException(status_code=500, detail="Internal server error")
+    
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
