@@ -38,9 +38,9 @@ yields_and_expenses_cols = [ 'NetExpenseRatio', 'SECYield', 'SECYieldDate',
 yields_and_expenses_numeric_cols = [ 'NetExpenseRatio', 'SECYield', 'CategoryNetExpenseRatio', 'Yield1Yr' ]
 
 market_price_and_cap_cols = [ 'DayEndMarketPrice', 'DayEndMarketPriceDate', 'SharesOutstanding',
-                              'SharesOutstandingDate' ]
+                              'SharesOutstandingDate', 'DayEndNAV', 'DayEndNAVDate' ]
 
-market_price_and_cap_numeric_cols = [ 'DayEndMarketPrice', 'MarketCapital', 'SharesOutstanding' ]
+market_price_and_cap_numeric_cols = [ 'DayEndMarketPrice', 'SharesOutstanding', 'DayEndNAV' ]
 
 categories_cols = [ 'BroadCategoryGroup', 'BroadCategoryGroupID',
                     'CategoryName', 'BroadAssetClass', 'PrimaryIndexId', 'PrimaryIndexName' ]
@@ -264,7 +264,8 @@ def to_snake_case(string):
         'SECYieldDate': 'sec_yield_date',
         'PortfolioDate': 'date',
         'Yield1Yr': 'yield_1_yr',
-        'Yield1YrDate': 'yield_1_yr_date'
+        'Yield1YrDate': 'yield_1_yr_date',
+        'DayEndNAV': 'day_end_market_price'
     }
     if string in special_cases:
         return special_cases[ string ]
@@ -296,7 +297,6 @@ def raw_df_processing(raw_df):
     df = df.dropna(subset=net_asset_allocation_cols, how='all')
     return df
 
-# TODO - remove reference to add_to_db
 def characteristics_processing(df, as_of_date, sec_type, characteristic_type, table_name):
     if characteristic_type == 'asset_allocation':
         processed_df = df[ common_cols + asset_allocation_cols ]
@@ -345,12 +345,31 @@ def characteristics_processing(df, as_of_date, sec_type, characteristic_type, ta
         processed_df[ 'Yield1YrDate' ].fillna(processed_df[ 'PortfolioDate' ], inplace=True)
     elif characteristic_type == 'market_price_and_cap':
         processed_df = df[ common_cols + market_price_and_cap_cols ]
+        for col in market_price_and_cap_numeric_cols:
+            processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce')
         processed_df = processed_df.dropna(subset=market_price_and_cap_cols, how='all')
         processed_df.loc[ processed_df[ 'DayEndMarketPriceDate' ].isin([ '', ' ' ]), 'DayEndMarketPriceDate' ] = np.nan
+        processed_df.loc[ processed_df[ 'DayEndNAVDate' ].isin([ '', ' ' ]), 'DayEndNAVDate' ] = np.nan
+        processed_df.loc[processed_df['SharesOutstandingDate'].isin([ '', ' ' ]), 'SharesOutstandingDate'] = np.nan
         processed_df[ 'DayEndMarketPriceDate' ].fillna(processed_df[ 'PortfolioDate' ], inplace=True)
-        processed_df[ 'MarketCapitalization' ] = processed_df[ 'DayEndMarketPrice' ] * processed_df[
-            'SharesOutstanding' ]
-        processed_df.dropna(subset='MarketCapitalization', inplace=True)
+        processed_df[ 'DayEndNAVDate' ].fillna(processed_df[ 'PortfolioDate' ], inplace=True)
+        processed_df['SharesOutstandingDate'].fillna(processed_df['PortfolioDate'], inplace=True)
+        if sec_type in ['OEF', 'MMF']:
+            processed_df['MarketCapitalization'] = processed_df['DayEndNAV'] * processed_df['SharesOutstanding']
+            processed_df['DayEndMarketPrice'] = processed_df['DayEndNAV']
+            processed_df['DayEndMarketPriceDate'] = processed_df['DayEndNAVDate']
+        elif sec_type in ['ETF', 'CEF']:
+            processed_df[ 'MarketCapitalization' ] = processed_df[ 'DayEndMarketPrice' ] * processed_df[
+                'SharesOutstanding' ]
+        processed_df.drop(columns=['DayEndNAV', 'DayEndNAVDate'], inplace=True)
+        date_cols = ['PortfolioDate', 'DayEndMarketPriceDate', 'SharesOutstandingDate']
+        for col in date_cols:
+            if col in processed_df.columns:
+                processed_df[col] = pd.to_datetime(processed_df[col], errors='coerce')
+                processed_df[col] = processed_df[col].dt.strftime('%Y-%m-%d')
+        
+        # Drop any remaining rows with NaT or NaN in date columns
+        processed_df = processed_df.dropna(subset=[col for col in date_cols if col in processed_df.columns])
 
     if 'processed_df' in locals():
         renamed_col_names = {}
@@ -606,5 +625,16 @@ def calculate_fund_stats(as_of_date, num_workers):
     logging.info(f"Fund annualized statistics calculation completed in {duration:.2f} seconds")
 
 # You can add this to your main function
-calculate_fund_stats('2024-09-10', 25)
+# calculate_fund_stats('2024-09-10', 25)
+etf_df = pd.read_csv('/Users/gokul/Dropbox/Mac/Documents/Personal/Prosper/prosper_app/src/datas/data_09_15_2024/raw/etf_universe_characteristics20240916.csv')
+characteristics_processing(etf_df, '2024-09-15', 'ETF', 'market_price_and_cap', 'funds_market_price_and_capitalization')
+
+mmf_df = pd.read_csv('/Users/gokul/Dropbox/Mac/Documents/Personal/Prosper/prosper_app/src/datas/data_09_15_2024/raw/MMF_Characteristics20240916.csv')
+characteristics_processing(mmf_df, '2024-09-15', 'MMF', 'market_price_and_cap', 'funds_market_price_and_capitalization')
+
+oef_df = pd.read_csv('/Users/gokul/Dropbox/Mac/Documents/Personal/Prosper/prosper_app/src/datas/data_09_15_2024/raw/OE_MF_Characteristics20240916.csv')
+characteristics_processing(oef_df, '2024-09-15', 'OEF', 'market_price_and_cap', 'funds_market_price_and_capitalization')
+
+cef_df = pd.read_csv('/Users/gokul/Dropbox/Mac/Documents/Personal/Prosper/prosper_app/src/datas/data_09_15_2024/raw/CE_MF_Characteristics20240916.csv')
+characteristics_processing(cef_df, '2024-09-15', 'CEF', 'market_price_and_cap', 'funds_market_price_and_capitalization')
 
