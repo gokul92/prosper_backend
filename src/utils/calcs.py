@@ -638,6 +638,8 @@ def tax_optimized_rebalance(
             r = []
             tax_lot_ids = []
             lot_shares_list = []
+            purchase_dates = []  # Added for purchase_date
+            capital_gains_types = []  # Added for capital_gains_type
 
             # Iterate over each tax lot
             for tax_lot_id, lot_data in original_data['tax_lots'].items():
@@ -687,6 +689,8 @@ def tax_optimized_rebalance(
                     r.append(tax_rate)
                     tax_lot_ids.append(tax_lot_id)
                     lot_shares_list.append(shares)
+                    purchase_dates.append(purchase_date)
+                    capital_gains_types.append(capital_gains_type)
 
             q = sum(q_m)
             delta = total_shares_to_sell
@@ -710,14 +714,18 @@ def tax_optimized_rebalance(
             total_taxes = np.sum(taxes_per_lot)
 
             # Build tax_lot entries
-            for i, (tax_lot_id, shares_to_sell, lot_shares, cost_basis, tax_incurred) in enumerate(zip(tax_lot_ids, shares_to_sell_per_lot, lot_shares_list, c, taxes_per_lot)):
+            for i, (tax_lot_id, shares_to_sell, lot_shares, cost_basis, tax_incurred, purchase_date, capital_gains_type) in enumerate(zip(tax_lot_ids, shares_to_sell_per_lot, lot_shares_list, c, taxes_per_lot, purchase_dates, capital_gains_types)):
                 if shares_to_sell > 0:
+                    gain_loss = (s - cost_basis) * shares_to_sell  # Added gain/loss calculation
                     tax_lots[tax_lot_id] = {
                         "adjusted_cost_basis": cost_basis,
                         "number_of_shares_in_original_portfolio": lot_shares,
                         "number_of_shares_in_optimized_portfolio": lot_shares - shares_to_sell,
                         "number_of_shares_traded": -shares_to_sell,
-                        "taxes_incurred": tax_incurred
+                        "taxes_incurred": tax_incurred,
+                        "purchase_date": purchase_date,  # Added purchase_date
+                        "capital_gains_type": capital_gains_type,  # Added capital_gains_type
+                        "gain_loss": gain_loss  # Added gain/loss
                     }
 
         elif delta_shares > 0:  # Buying shares
@@ -728,7 +736,10 @@ def tax_optimized_rebalance(
                 "number_of_shares_in_original_portfolio": 0.0,
                 "number_of_shares_in_optimized_portfolio": delta_shares,
                 "number_of_shares_traded": delta_shares,
-                "taxes_incurred": 0.0  # No taxes incurred when buying
+                "taxes_incurred": 0.0,  # No taxes incurred when buying
+                "purchase_date": as_of_date_str,  # Added purchase_date
+                "capital_gains_type": None,  # No capital gains type for new purchases
+                "gain_loss": 0.0  # No gain/loss on purchase
             }
 
         else:
@@ -784,10 +795,238 @@ def tax_optimized_rebalance(
         "weight_in_original_portfolio": weight_in_original_cash,
         "weight_in_optimized_portfolio": weight_in_optimized_cash,
         "number_of_shares_traded": cash_delta,
-        "tax_lots": {}
+        "tax_lots": {},
+        "purchase_date": None,  # No purchase date for cash
+        "capital_gains_type": None,  # No capital gains type for cash
+        "gain_loss": 0.0  # No gain/loss for cash
     }
 
     return {
         "status": "success",
         "tax_optimal_trades": trades
     }
+
+def fetch_portfolio_data(as_of_date: str, portfolio_id: str = None, account_id: str = None) -> List[Dict]:
+    """
+    Fetches portfolio data based on portfolio_id and/or account_id for a given as_of_date.
+    Modified to include price and other fields similar to fetch_account_data.
+    
+    Args:
+        as_of_date (str): The date for which to fetch portfolio data in 'YYYY-MM-DD' format.
+        portfolio_id (str, optional): The portfolio ID to filter the data.
+        account_id (str, optional): The account ID to filter the data.
+    
+    Returns:
+        List[Dict]: A list of portfolio holdings with additional data.
+    
+    Raises:
+        ValueError: If neither portfolio_id nor account_id is provided.
+        Exception: For any database-related errors.
+    """
+    if not portfolio_id and not account_id:
+        raise ValueError("Either portfolio_id or account_id must be provided.")
+    
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                # Construct query based on provided IDs
+                if portfolio_id:
+                    id_field = 'portfolio_id'
+                    id_value = portfolio_id
+                else:
+                    id_field = 'account_id'
+                    id_value = account_id
+
+                query = f"""
+                WITH latest_holdings AS (
+                    SELECT {id_field}, MAX(as_of_date) as max_date
+                    FROM portfolio_holdings
+                    WHERE {id_field} = %s AND as_of_date <= %s
+                    GROUP BY {id_field}
+                )
+                SELECT ph.symbol, ph.quantity, ph.as_of_date,
+                       sm.security_type, sm.mstar_id,
+                       CASE
+                           WHEN sm.security_type = 'Equity' THEN eph.close_price
+                           ELSE fmp.day_end_market_price
+                       END as price
+                FROM portfolio_holdings ph
+                JOIN latest_holdings lh ON ph.{id_field} = lh.{id_field} AND ph.as_of_date = lh.max_date
+                LEFT JOIN LATERAL (
+                    SELECT symbol, security_type, mstar_id
+                    FROM security_master
+                    WHERE symbol = ph.symbol AND as_of_date <= %s
+                    ORDER BY as_of_date DESC
+                    LIMIT 1
+                ) sm ON true
+                LEFT JOIN LATERAL (
+                    SELECT ticker, close_price
+                    FROM equities_price_history
+                    WHERE ticker = ph.symbol AND date <= %s
+                    ORDER BY date DESC
+                    LIMIT 1
+                ) eph ON sm.security_type = 'Equity'
+                LEFT JOIN LATERAL (
+                    SELECT ticker, day_end_market_price
+                    FROM funds_market_price_and_capitalization
+                    WHERE ticker = ph.symbol AND date <= %s
+                    ORDER BY date DESC
+                    LIMIT 1
+                ) fmp ON sm.security_type IN ('OEF', 'CEF', 'ETF', 'MMF')
+                WHERE ph.{id_field} = %s
+                """
+
+                params = (id_value, as_of_date, as_of_date, as_of_date, as_of_date, id_value)
+
+                cur.execute(query, params)
+                holdings = cur.fetchall()
+
+                if not holdings:
+                    logger.warning(f"No portfolio holdings found for {id_field} '{id_value}' on or before {as_of_date}.")
+                    return []
+
+                return [dict(row) for row in holdings]
+
+    except psycopg.Error as e:
+        logger.error(f"Database error occurred: {e}")
+        raise Exception("An error occurred while fetching portfolio data.") from e
+    except Exception as ex:
+        logger.error(f"An unexpected error occurred: {ex}")
+        raise
+
+def fetch_fund_asset_allocation(symbol: str, as_of_date: str) -> Dict[str, Any]:
+    """
+    Fetches the asset allocation data for a given fund symbol as of a specific date.
+    
+    Args:
+        symbol (str): The ticker symbol of the fund.
+        as_of_date (str): The date for which to fetch the data in 'YYYY-MM-DD' format.
+    
+    Returns:
+        Dict[str, Any]: A dictionary containing the asset allocation data.
+    """
+    query = """
+    WITH latest_data AS (
+        SELECT mstar_id, MAX(as_of_date) as max_date
+        FROM funds_asset_allocation
+        WHERE ticker = %s AND as_of_date <= %s
+        GROUP BY mstar_id
+    )
+    SELECT faa.*
+    FROM funds_asset_allocation faa
+    INNER JOIN latest_data ld ON faa.mstar_id = ld.mstar_id AND faa.as_of_date = ld.max_date
+    WHERE faa.ticker = %s AND faa.as_of_date = ld.max_date
+    LIMIT 1
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (symbol, as_of_date, symbol))
+            result = cur.fetchone()
+            if result:
+                return dict(result)
+            else:
+                return None
+
+def calculate_asset_allocation(
+    as_of_date: str,
+    argument_type: str,
+    argument_id: str
+) -> Dict[str, float]:
+    """
+    Calculates the asset allocation for a given portfolio or account holding.
+    
+    Args:
+        as_of_date (str): The date for which to perform the calculation in 'YYYY-MM-DD' format.
+        argument_type (str): 'account' or 'portfolio' indicating the type of ID provided.
+        argument_id (str): The account_id or portfolio_id based on the argument_type.
+    
+    Returns:
+        Dict[str, float]: A dictionary with asset allocation percentages for each component.
+    
+    Raises:
+        ValueError: If invalid argument_type is provided or if required data is missing.
+        Exception: For any database or data retrieval related errors.
+    """
+    if argument_type not in ('account', 'portfolio'):
+        raise ValueError("argument_type must be either 'account' or 'portfolio'.")
+
+    # Fetch holdings based on argument_type
+    if argument_type == 'account':
+        holdings = fetch_account_data(account_id=argument_id, as_of_date=as_of_date)
+    elif argument_type == 'portfolio':
+        holdings = fetch_portfolio_data(as_of_date=as_of_date, portfolio_id=argument_id)
+    else:
+        raise ValueError("Invalid argument_type provided.")
+
+    if not holdings:
+        raise ValueError(f"No holdings found for {argument_type}_id '{argument_id}' on or before {as_of_date}.")
+
+    # Ensure holdings have the required data
+    required_fields = ['symbol', 'quantity', 'price', 'security_type']
+    for holding in holdings:
+        for field in required_fields:
+            if field not in holding or holding[field] is None:
+                raise ValueError(f"Missing required field '{field}' in holdings data for symbol '{holding.get('symbol', 'unknown')}'.")
+
+    # Calculate weights of each security
+    weights, total_value = calculate_symbol_weights(holdings)
+
+    # Initialize asset allocation components
+    asset_allocation = {
+        'bond': 0.0,
+        'cash': 0.0,
+        'convertible': 0.0,
+        'other': 0.0,
+        'preferred': 0.0,
+        'stock': 0.0
+    }
+
+    for holding in holdings:
+        symbol = holding['symbol']
+        security_type = holding['security_type']
+        weight = weights[symbol]['weight']
+
+        if security_type == 'Equity':
+            # Equity is classified as 100% stock
+            allocation = {
+                'bond': 0.0,
+                'cash': 0.0,
+                'convertible': 0.0,
+                'other': 0.0,
+                'preferred': 0.0,
+                'stock': 100.0
+            }
+        elif security_type in ('ETF', 'MMF', 'OEF', 'CEF'):
+            # Fetch asset allocation from funds_asset_allocation table
+            fund_allocation = fetch_fund_asset_allocation(
+                symbol=symbol,
+                as_of_date=as_of_date
+            )
+            if not fund_allocation:
+                raise ValueError(f"Asset allocation data not found for fund symbol '{symbol}'.")
+
+            # Ensure all required asset allocation fields are present
+            allocation_fields = ['bond_net', 'cash_net', 'convertible_net', 'other_net', 'preferred_net', 'stock_net']
+            if not all(field in fund_allocation and fund_allocation[field] is not None for field in allocation_fields):
+                raise ValueError(f"Asset allocation data incomplete for fund symbol '{symbol}'.")
+
+            allocation = {
+                'bond': fund_allocation['bond_net'],
+                'cash': fund_allocation['cash_net'],
+                'convertible': fund_allocation['convertible_net'],
+                'other': fund_allocation['other_net'],
+                'preferred': fund_allocation['preferred_net'],
+                'stock': fund_allocation['stock_net']
+            }
+        else:
+            raise ValueError(f"Unsupported security type '{security_type}' for symbol '{symbol}'.")
+
+        # Weighted average calculation
+        for component in asset_allocation:
+            asset_allocation[component] += weight * allocation[component] / 100.0  # Convert percentage to fraction
+
+    # Convert fractions back to percentages
+    for component in asset_allocation:
+        asset_allocation[component] *= 100.0
+
+    return asset_allocation
