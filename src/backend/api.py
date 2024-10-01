@@ -1,14 +1,14 @@
-from fastapi import FastAPI, Depends, HTTPException, Security
+from fastapi import FastAPI, Depends, HTTPException, Security, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt
 from jose.exceptions import JWTError
 from pydantic import BaseModel, UUID4, validator, Field, EmailStr
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import requests
 import os
 import psycopg
 from dotenv import load_dotenv
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from uuid import uuid4
 from psycopg import errors as psycopg_errors
 import logging
@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg.rows import dict_row
 from ..utils.validators import validate_payload
-from ..utils.calcs import portfolio_statistics, optimized_portfolio_stats, tax_optimized_rebalance, fetch_account_data
+from ..utils.calcs import portfolio_statistics, optimized_portfolio_stats, tax_optimized_rebalance, fetch_account_data, fetch_portfolio_data, calculate_asset_allocation
 from ..domain_logic.tax_rates_calc import IncomeTaxRates
 import json
 from contextlib import asynccontextmanager
@@ -270,9 +270,6 @@ class AccountHoldingsCreate(BaseModel):
     account_id: UUID4
     holdings: List[AccountHolding]
 
-import logging
-from fastapi import HTTPException, Depends
-from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -805,8 +802,6 @@ def optimize_taxes(
         # Get the current holdings using the fetch_account_data function
         holdings = fetch_account_data(account_id, as_of_date.isoformat())
 
-        logger.info(f"Holdings: {holdings}")
-
         if not holdings:
             logger.warning(f"No holdings found for account {account_id} on {as_of_date}")
             raise HTTPException(status_code=404, detail="No holdings found for this account on the latest date")
@@ -930,6 +925,19 @@ def optimize_taxes(
                 long_term_tax_rate=long_term_tax_rate
             )
 
+            # Write result to file
+            output_dir = "data/temp_debug"
+            os.makedirs(output_dir, exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"tax_optimized_rebalance_{account_id}_{timestamp}.json"
+            filepath = os.path.join(output_dir, filename)
+            
+            with open(filepath, 'w') as f:
+                json.dump(result, f, indent=2, default=str)
+            
+            logger.info(f"Tax optimized rebalance result written to {filepath}")
+
             # Return the result with a success status
             logger.info(f"Successfully optimized taxes for account {account_id}")
             return {
@@ -947,6 +955,337 @@ def optimize_taxes(
             # Log unexpected errors and return a generic internal server error
             logger.exception(f"Unexpected error during tax optimized rebalance: {str(e)}")
             raise HTTPException(status_code=500, detail="Internal server error")
+
+class PortfolioHolding(BaseModel):
+       symbol: str
+       quantity: float
+       as_of_date: Optional[date] = None
+       purchase_date: Optional[date] = None
+       capital_gains_type: Optional[str] = None
+       total_cost: Optional[float] = None
+       security_type: Optional[str] = None
+       cusip: Optional[str] = None
+       mstar_id: Optional[str] = None
+
+       @validator("quantity")
+       def quantity_must_be_positive(cls, v):
+           if v <= 0:
+               raise ValueError("Quantity must be greater than 0")
+           return v
+
+class PortfolioHoldingsCreate(BaseModel):
+    portfolio_id: UUID4
+    account_id: UUID4
+    holdings: List[PortfolioHolding]
+
+@app.post("/add-portfolio-holdings")
+def add_portfolio_holdings(
+    holdings_data: PortfolioHoldingsCreate,
+    current_user: str = Depends(get_current_user)
+):
+    logger.info(f"Received request to add holdings for portfolio: {holdings_data.portfolio_id}")
+    logger.debug(f"Holdings data: {holdings_data.model_dump()}")
+
+    with get_db_connection() as conn:
+        try:
+            with conn.cursor(row_factory=dict_row) as cur:
+                # Check if the portfolio exists and belongs to the current user
+                logger.debug(f"Checking if portfolio exists for user: {current_user}")
+                cur.execute(
+                    "SELECT 1 FROM portfolio_holdings WHERE portfolio_id = %s AND user_id = %s",
+                    (holdings_data.portfolio_id, current_user)
+                )
+                if cur.fetchone() is None:
+                    logger.warning(f"Portfolio not found or doesn't belong to user. Portfolio ID: {holdings_data.portfolio_id}, User ID: {current_user}")
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Portfolio not found or doesn't belong to the current user. Portfolio ID: {holdings_data.portfolio_id}, User ID: {current_user}",
+                    )
+
+                logger.debug("Portfolio found, proceeding with holdings validation")
+
+                # Validate symbols against security_master and adjust as_of_date
+                for holding in holdings_data.holdings:
+                    logger.debug(f"Validating holding: {holding.dict()}")
+
+                    # Set default as_of_date if not provided
+                    holding_as_of_date = holding.as_of_date or date.today()
+
+                    query = """
+                    SELECT 
+                        symbol, 
+                        security_type, 
+                        cusip, 
+                        mstar_id,
+                        as_of_date
+                    FROM security_master
+                    WHERE symbol = %s
+                    """
+                    params = [holding.symbol]
+
+                    if holding.security_type:
+                        query += " AND security_type = %s"
+                        params.append(holding.security_type)
+                    if holding.cusip:
+                        query += " AND cusip = %s"
+                        params.append(holding.cusip)
+
+                    query += " AND as_of_date <= %s"
+                    params.append(holding_as_of_date)
+
+                    query += " ORDER BY as_of_date DESC LIMIT 1"
+
+                    logger.debug(f"Executing query: {query} with params: {params}")
+                    cur.execute(query, params)
+                    security = cur.fetchone()
+
+                    if not security:
+                        logger.warning(f"Invalid symbol, security_type, or cusip combination or no matching as_of_date for symbol: {holding.symbol}")
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Invalid symbol, security_type, or cusip combination or no matching as_of_date for symbol: {holding.symbol}"
+                        )
+
+                    logger.debug(f"Security found: {security}")
+                    # Update holding with fetched data
+                    holding.security_type = security['security_type']
+                    holding.cusip = security['cusip']
+                    if 'mstar_id' in security and security['mstar_id']:
+                        holding.mstar_id = security['mstar_id']
+                    # Use the as_of_date from security_master to satisfy foreign key constraint
+                    holding.as_of_date = security['as_of_date']
+
+                logger.debug("All holdings validated, preparing for insertion")
+
+                # Prepare the query for inserting multiple holdings
+                insert_query = """
+                    INSERT INTO portfolio_holdings 
+                    (symbol, quantity, as_of_date, created_at, account_id, 
+                     security_type, cusip, mstar_id, portfolio_id, user_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """
+
+                # Prepare the data for bulk insert
+                insert_data = [
+                    (
+                        holding.symbol,
+                        holding.quantity,
+                        holding.as_of_date,
+                        datetime.now(timezone.utc),
+                        holdings_data.account_id,
+                        holding.security_type,
+                        holding.cusip,
+                        holding.mstar_id,
+                        holdings_data.portfolio_id,
+                        current_user
+                    )
+                    for holding in holdings_data.holdings
+                ]
+
+                logger.debug(f"Executing bulk insert with {len(insert_data)} holdings")
+                logger.debug(f"Insert query: {insert_query}")
+                logger.debug(f"Insert data: {insert_data}")
+                
+                try:
+                    # Execute the bulk insert
+                    cur.executemany(insert_query, insert_data)
+                except psycopg.errors.ForeignKeyViolation as e:
+                    logger.error(f"Foreign key violation during bulk insert: {str(e)}")
+                    raise HTTPException(status_code=400, detail=f"Foreign key violation: {str(e)}")
+                except psycopg.Error as e:
+                    logger.error(f"Database error during bulk insert: {str(e)}")
+                    raise HTTPException(status_code=500, detail=f"Database error during bulk insert: {str(e)}")
+
+            conn.commit()
+            logger.info(f"Successfully added {len(holdings_data.holdings)} holdings to portfolio {holdings_data.portfolio_id}")
+        except HTTPException as http_exc:
+            logger.exception("HTTP exception occurred")
+            raise http_exc
+        except psycopg_errors.ForeignKeyViolation:
+            raise HTTPException(status_code=400, detail="Invalid portfolio ID or account ID")
+        except psycopg_errors.CheckViolation as e:
+            raise HTTPException(status_code=400, detail=f"Constraint violation: {str(e)}")
+        except psycopg_errors.UniqueViolation:
+            raise HTTPException(
+                status_code=409, detail="Duplicate entry for portfolio holdings"
+            )
+        except psycopg_errors.NotNullViolation as e:
+            raise HTTPException(status_code=400, detail=f"Missing required field: {str(e)}")
+        except psycopg.Error as e:
+            conn.rollback()
+            logger.exception(f"Database error while adding portfolio holdings: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+    return {
+        "status": "success",
+        "message": f"Added {len(holdings_data.holdings)} holdings to the portfolio",
+        "portfolio_id": holdings_data.portfolio_id  # Added portfolio_id to the response
+    }
+
+class PortfolioHolding(BaseModel):
+    symbol: str
+    quantity: float
+    as_of_date: date
+    created_at: date
+    account_id: UUID
+    security_type: str
+    cusip: str
+    mstar_id: str
+    portfolio_id: UUID
+    # Add any additional fields as necessary
+
+class GetPortfolioHoldingsResponse(BaseModel):
+    status: str
+    holdings: List[PortfolioHolding]
     
+@app.get("/get-portfolio-holdings", response_model=GetPortfolioHoldingsResponse)
+def get_portfolio_holdings(
+    portfolio_id: Optional[UUID] = Query(None, description="The UUID of the portfolio to fetch holdings for"),
+    account_id: Optional[UUID] = Query(None, description="The UUID of the account associated with the portfolio"),
+    as_of_date: datetime = Query(..., description="The date for which to fetch portfolio holdings in YYYY-MM-DD format"),
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Retrieves the holdings of a specific portfolio as of a given date.
+    Optionally filters by account_id.
+
+    Args:
+        portfolio_id (Optional[UUID]): The UUID of the portfolio.
+        account_id (Optional[UUID]): The UUID of the account.
+        as_of_date (datetime): The date for which to retrieve the holdings.
+        current_user (str): The currently authenticated user.
+
+    Returns:
+        GetPortfolioHoldingsResponse: A response model containing the status and list of holdings.
+    """
+    logger.info(f"User {current_user} requested holdings for portfolio {portfolio_id} and account {account_id} as of {as_of_date.date()}")
+    
+    if not portfolio_id and not account_id:
+        logger.error("Both portfolio_id and account_id are missing in the request.")
+        raise HTTPException(
+            status_code=400,
+            detail="At least one of portfolio_id or account_id must be provided."
+        )
+    
+    try:
+        holdings = fetch_portfolio_data(
+            as_of_date=as_of_date.strftime("%Y-%m-%d"),
+            portfolio_id=str(portfolio_id) if portfolio_id else None,
+            account_id=str(account_id) if account_id else None
+        )
+
+        if not holdings:
+            logger.warning(f"No holdings found for portfolio_id {portfolio_id} and account_id {account_id} on or before {as_of_date.date()}.")
+            raise HTTPException(
+                status_code=404,
+                detail=f"No holdings found for the specified portfolio and/or account on or before {as_of_date.date()}."
+            )
+
+        # Convert holdings to PortfolioHolding models
+        portfolio_holdings = [PortfolioHolding(**holding) for holding in holdings]
+
+        return GetPortfolioHoldingsResponse(
+            status="success",
+            holdings=portfolio_holdings
+        )
+
+    except ValueError as ve:
+        logger.error(f"Validation error: {ve}")
+        raise HTTPException(
+            status_code=400,
+            detail=str(ve)
+        )
+    except HTTPException as http_exc:
+        # Re-raise HTTP exceptions
+        logger.exception(f"HTTPException occurred: {http_exc.detail}")
+        raise http_exc
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while fetching portfolio holdings."
+        )
+    
+@app.get("/asset-allocation")
+def get_asset_allocation(
+    ids: List[UUID] = Query(..., description="List of portfolio or account IDs."),
+    types: List[str] = Query(..., description="List of types corresponding to each ID ('account' or 'portfolio')."),
+    as_of_date: datetime = Query(..., description="As of date in 'YYYY-MM-DD' format."),
+    current_user: str = Depends(get_current_user)
+) -> Dict[str, Dict[str, float]]:
+    """
+    Retrieves the asset allocation for a list of portfolios or accounts as of a given date.
+
+    Args:
+        ids (List[UUID]): A list of portfolio or account IDs.
+        types (List[str]): Corresponding types for each ID ('account' or 'portfolio').
+        as_of_date (datetime): The date for which to retrieve the asset allocations.
+        current_user (str): The currently authenticated user.
+
+    Returns:
+        Dict[str, Dict[str, float]]: A dictionary where keys are IDs and values are asset allocation objects.
+    """
+    logger.info(f"User {current_user} requested asset allocation for IDs {ids} with types {types} as of {as_of_date.date()}.")
+
+    if len(ids) != len(types):
+        logger.error("The number of IDs and types provided do not match.")
+        raise HTTPException(
+            status_code=400,
+            detail="The number of IDs and types must be the same."
+        )
+
+    valid_types = {'account', 'portfolio'}
+    allocations = {}
+
+    for idx, id_value in enumerate(ids):
+        id_str = str(id_value)
+        type_value = types[idx].lower()
+
+        if type_value not in valid_types:
+            logger.error(f"Invalid type '{type_value}' provided for ID '{id_str}'.")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid type '{type_value}' for ID '{id_str}'. Allowed types are 'account' or 'portfolio'."
+            )
+
+        try:
+            # Calculate asset allocation using the utility function
+            allocation = calculate_asset_allocation(
+                as_of_date=as_of_date.strftime("%Y-%m-%d"),
+                argument_type=type_value,
+                argument_id=id_str
+            )
+            allocations[id_str] = allocation
+
+        except ValueError as ve:
+            logger.error(f"ValueError for ID '{id_str}': {ve}")
+            # Include the ID in the error detail
+            raise HTTPException(
+                status_code=400,
+                detail=f"Error for ID '{id_str}': {ve}"
+            )
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred for ID '{id_str}': {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"An unexpected error occurred while processing ID '{id_str}'."
+            )
+        
+    # Write allocations to JSON file
+    json_filename = f"asset_allocations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    json_filepath = os.path.join("data", "asset_allocations", json_filename)
+
+    # Ensure the directory exists
+    os.makedirs(os.path.dirname(json_filepath), exist_ok=True)
+
+    # Write the JSON file
+    with open(json_filepath, 'w') as json_file:
+        json.dump(allocations, json_file, cls=CustomJSONEncoder, indent=2)
+
+    logger.info(f"Asset allocations written to {json_filepath}")
+
+    # Return the allocations as a JSON response
+    return allocations
+
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
