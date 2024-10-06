@@ -9,7 +9,7 @@ import os
 import psycopg
 from dotenv import load_dotenv
 from datetime import date, datetime, timezone
-from uuid import uuid4
+from uuid import uuid4, UUID
 from psycopg import errors as psycopg_errors
 import logging
 from urllib.parse import urlparse
@@ -29,7 +29,6 @@ import hashlib
 from contextlib import asynccontextmanager
 from fastapi.exceptions import RequestValidationError
 from src.utils.json_utils import CustomJSONEncoder, process_for_json
-from uuid import UUID
 import math
 from collections import defaultdict
 logger = logging.getLogger(__name__)
@@ -568,6 +567,14 @@ def validate_account_id(account_id: str, current_user: str, conn: psycopg.Connec
         )
         return cur.fetchone() is not None
 
+# TODO - Create a portfolios table and use it here. For now, use the portfolio_holdings table
+def validate_portfolio_id(portfolio_id: str, user_id: str, conn) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 FROM portfolio_holdings WHERE portfolio_id = %s AND user_id = %s LIMIT 1
+        """, (portfolio_id, user_id))
+        return cur.fetchone() is not None
+
 def fetch_account_statistics(account_id: str, current_user: str, conn: psycopg.Connection) -> dict:
     if not validate_account_id(account_id, current_user, conn):
         raise HTTPException(
@@ -645,6 +652,8 @@ def monte_carlo_simulation(
             # If not cached, perform the simulation
             simulation_result = optimized_portfolio_stats(account_id, as_of_date)
 
+            print("simulation result completed")
+
             # Prepare response
             result = {
                 "account_id": account_id,
@@ -653,9 +662,14 @@ def monte_carlo_simulation(
                 "optimized_portfolios": simulation_result['optimized_portfolios']
             }
 
+            print("result prepared")
+
             processed_result = process_for_json(result)
 
+            print("result processed")
+
             # Write response to JSON file
+            # from pathlib import Path
             # data_dir = Path(__file__).parent.parent.parent / 'data' / 'temp_debug'
             # data_dir.mkdir(exist_ok=True)
             # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -675,12 +689,18 @@ def monte_carlo_simulation(
                 )
             conn.commit()
 
+            print("result cached")
+
             # Update in-memory cache
             get_cached_simulation.cache_clear()
             get_cached_simulation(cache_key)
 
+            print("result cached in memory")
+
             # Use jsonable_encoder to prepare the response
             json_compatible_result = jsonable_encoder(processed_result)
+
+            print("result json compatible")
             return JSONResponse(content=json_compatible_result)
 
     except HTTPException:
@@ -750,10 +770,6 @@ def get_tax_rates(current_user: str = Depends(get_current_user)):
             logger.error(f"Database error while fetching tax rates: {str(e)}")
             raise HTTPException(status_code=500, detail="Internal server error")
         
-# Define the Pydantic model for the request body
-class OptimizeTaxesRequest(BaseModel):
-    account_id: UUID4
-    optimized_portfolio: Dict[str, Any]
 
 # Add the following helper function to fetch tax rates
 def fetch_user_tax_rates(user_id: str, target_date: date, conn: psycopg.Connection) -> Dict:
@@ -771,25 +787,36 @@ def fetch_user_tax_rates(user_id: str, target_date: date, conn: psycopg.Connecti
         if not tax_rates:
             raise HTTPException(status_code=404, detail="Tax rates not found for the user on or before the specified date")
         return tax_rates
+    
+# Define the Pydantic model for the request body
+class OptimizeTaxesRequest(BaseModel):
+    account_id: UUID4
+    optimized_portfolio: Dict[str, Any]
 
 @app.post("/optimize-taxes")
 def optimize_taxes(
-    request: OptimizeTaxesRequest,
+    account_id: UUID4,
+    portfolio_id: UUID4,
     current_user: str = Depends(get_current_user)
 ):
-    logger.info(f"Received optimize taxes request for account: {request.account_id}")
-    logger.debug(f"Request data: {request.model_dump()}")
+    logger.info(f"Received optimize taxes request for account: {account_id} and portfolio: {portfolio_id}")
 
-    account_id = str(request.account_id)
     as_of_date = date.today()
 
     with get_db_connection() as conn:
-        # Validate that the account belongs to the current user
-        if not validate_account_id(account_id, current_user, conn):
+        # Validate that the account and portfolio belong to the current user
+        if not validate_account_id(str(account_id), current_user, conn):
             logger.warning(f"Account not found or doesn't belong to user. Account ID: {account_id}, User ID: {current_user}")
             raise HTTPException(
                 status_code=404,
                 detail="Account not found or doesn't belong to the current user"
+            )
+
+        if not validate_portfolio_id(str(portfolio_id), current_user, conn):
+            logger.warning(f"Portfolio not found or doesn't belong to user. Portfolio ID: {portfolio_id}, User ID: {current_user}")
+            raise HTTPException(
+                status_code=404,
+                detail="Portfolio not found or doesn't belong to the current user"
             )
 
         # Fetch the appropriate tax rates for the user
@@ -800,18 +827,27 @@ def optimize_taxes(
         long_term_tax_rate = tax_rates['federal_long_term_capital_gains_rate']
 
         # Get the current holdings using the fetch_account_data function
-        holdings = fetch_account_data(account_id, as_of_date.isoformat())
+        holdings = fetch_account_data(str(account_id), as_of_date.isoformat())
 
         if not holdings:
             logger.warning(f"No holdings found for account {account_id} on {as_of_date}")
             raise HTTPException(status_code=404, detail="No holdings found for this account on the latest date")
 
-        # Organize holdings by symbol
+        # Get the optimized portfolio holdings using the fetch_portfolio_data function
+        optimized_holdings = fetch_portfolio_data(as_of_date.isoformat(), portfolio_id=str(portfolio_id))
+
+        if not optimized_holdings:
+            logger.warning(f"No holdings found for portfolio {portfolio_id} on {as_of_date}")
+            raise HTTPException(status_code=404, detail="No holdings found for this portfolio on the latest date")
+
+        # Proceed with preparing the original_portfolio and optimized_portfolio data structures
+        # The rest of the logic remains the same, using holdings and optimized_holdings
+        # Prepare the original_portfolio data structure
+
         portfolio_by_symbol = defaultdict(list)
         for holding in holdings:
             portfolio_by_symbol[holding['symbol']].append(holding)
 
-        # Prepare the original_portfolio data structure
         original_portfolio = {}
 
         for symbol, symbol_holdings in portfolio_by_symbol.items():
@@ -823,25 +859,10 @@ def optimize_taxes(
                 security_type = holding['security_type']
                 shares = holding['quantity']
                 mstar_id = holding.get('mstar_id')
-
-                # Retrieve the price from optimized_portfolio's holdings
-                optimized_holding = next(
-                    (item for item in request.optimized_portfolio.get('holdings', []) if item['symbol'] == symbol),
-                    None
-                )
-
-                if not optimized_holding:
-                    logger.error(f"Price for symbol {symbol} not found in optimized_portfolio")
-                    raise HTTPException(status_code=400, detail=f"Price for symbol {symbol} not provided in optimized_portfolio")
-
-                current_price = optimized_holding.get('latest_market_price')
-
-                if current_price is None:
-                    logger.error(f"Latest market price for symbol {symbol} is missing in optimized_portfolio")
-                    raise HTTPException(status_code=400, detail=f"Latest market price for symbol {symbol} is missing in optimized_portfolio")
+                current_price = holding.get('price', 0.0)
 
                 total_value = shares * current_price
-                account_balance = request.optimized_portfolio.get('account_balance', 1.0)
+                account_balance = sum(h['quantity'] * h.get('price', 0.0) for h in holdings if h.get('price', 0.0) > 0)
                 weight = total_value / account_balance if account_balance > 0 else 0.0
 
                 # Convert dates to strings if necessary
@@ -893,16 +914,19 @@ def optimize_taxes(
         # Prepare the optimized_portfolio data structure
         optimized_portfolio = {}
 
-        for holding in request.optimized_portfolio.get('holdings', []):
+        for holding in optimized_holdings:
             symbol = holding['symbol']
-            current_price = holding.get('latest_market_price')
-            shares = holding.get('shares', 0.0)
+            current_price = holding.get('price', 0.0)
+            shares = holding.get('quantity', 0.0)
             security_type = holding.get('security_type', 'Unknown')
             mstar_id = holding.get('mstar_id')
             adjusted_cost_basis = holding.get('adjusted_cost_basis', current_price)
 
             total_value = shares * current_price
-            weight = total_value / account_balance if account_balance > 0 else 0.0
+            optimized_account_balance = sum(
+                h['quantity'] * h.get('price', 0.0) for h in optimized_holdings if h.get('price', 0.0) > 0
+            )
+            weight = total_value / optimized_account_balance if optimized_account_balance > 0 else 0.0
 
             optimized_portfolio[symbol] = {
                 'symbol': symbol,
@@ -925,25 +949,10 @@ def optimize_taxes(
                 long_term_tax_rate=long_term_tax_rate
             )
 
-            # Write result to file
-            output_dir = "data/temp_debug"
-            os.makedirs(output_dir, exist_ok=True)
-            
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"tax_optimized_rebalance_{account_id}_{timestamp}.json"
-            filepath = os.path.join(output_dir, filename)
-            
-            with open(filepath, 'w') as f:
-                json.dump(result, f, indent=2, default=str)
-            
-            logger.info(f"Tax optimized rebalance result written to {filepath}")
-
             # Return the result with a success status
-            logger.info(f"Successfully optimized taxes for account {account_id}")
-            return {
-                'status': 'success',
-                'tax_optimal_trades': result['tax_optimal_trades']
-            }
+            logger.info(f"Successfully optimized taxes for account {account_id} and portfolio {portfolio_id}")
+            return JSONResponse(content=result)
+
         except ValueError as e:
             # Handle expected errors from input validation
             logger.error(f"ValueError during tax optimized rebalance: {str(e)}")
@@ -960,9 +969,6 @@ class PortfolioHolding(BaseModel):
        symbol: str
        quantity: float
        as_of_date: Optional[date] = None
-       purchase_date: Optional[date] = None
-       capital_gains_type: Optional[str] = None
-       total_cost: Optional[float] = None
        security_type: Optional[str] = None
        cusip: Optional[str] = None
        mstar_id: Optional[str] = None
@@ -974,7 +980,6 @@ class PortfolioHolding(BaseModel):
            return v
 
 class PortfolioHoldingsCreate(BaseModel):
-    portfolio_id: UUID4
     account_id: UUID4
     holdings: List[PortfolioHolding]
 
@@ -983,30 +988,22 @@ def add_portfolio_holdings(
     holdings_data: PortfolioHoldingsCreate,
     current_user: str = Depends(get_current_user)
 ):
-    logger.info(f"Received request to add holdings for portfolio: {holdings_data.portfolio_id}")
-    logger.debug(f"Holdings data: {holdings_data.model_dump()}")
+    # logger.info(f"Received request to add holdings for a new portfolio.")
+    # logger.info(f"Holdings data: {holdings_data.model_dump()}")
 
     with get_db_connection() as conn:
         try:
             with conn.cursor(row_factory=dict_row) as cur:
-                # Check if the portfolio exists and belongs to the current user
-                logger.debug(f"Checking if portfolio exists for user: {current_user}")
-                cur.execute(
-                    "SELECT 1 FROM portfolio_holdings WHERE portfolio_id = %s AND user_id = %s",
-                    (holdings_data.portfolio_id, current_user)
-                )
-                if cur.fetchone() is None:
-                    logger.warning(f"Portfolio not found or doesn't belong to user. Portfolio ID: {holdings_data.portfolio_id}, User ID: {current_user}")
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Portfolio not found or doesn't belong to the current user. Portfolio ID: {holdings_data.portfolio_id}, User ID: {current_user}",
-                    )
+                # Generate a new portfolio_id
+                new_portfolio_id = uuid4()
+                logger.debug(f"Generated new portfolio_id: {new_portfolio_id}")
 
-                logger.debug("Portfolio found, proceeding with holdings validation")
+                # Proceed with holdings validation
+                logger.debug("Proceeding with holdings validation")
 
                 # Validate symbols against security_master and adjust as_of_date
                 for holding in holdings_data.holdings:
-                    logger.debug(f"Validating holding: {holding.dict()}")
+                    logger.debug(f"Validating holding: {holding.model_dump()}")
 
                     # Set default as_of_date if not provided
                     holding_as_of_date = holding.as_of_date or date.today()
@@ -1049,7 +1046,7 @@ def add_portfolio_holdings(
                     logger.debug(f"Security found: {security}")
                     # Update holding with fetched data
                     holding.security_type = security['security_type']
-                    holding.cusip = security['cusip']
+                    holding.cusip = security.get('cusip')
                     if 'mstar_id' in security and security['mstar_id']:
                         holding.mstar_id = security['mstar_id']
                     # Use the as_of_date from security_master to satisfy foreign key constraint
@@ -1076,7 +1073,7 @@ def add_portfolio_holdings(
                         holding.security_type,
                         holding.cusip,
                         holding.mstar_id,
-                        holdings_data.portfolio_id,
+                        new_portfolio_id,
                         current_user
                     )
                     for holding in holdings_data.holdings
@@ -1085,7 +1082,7 @@ def add_portfolio_holdings(
                 logger.debug(f"Executing bulk insert with {len(insert_data)} holdings")
                 logger.debug(f"Insert query: {insert_query}")
                 logger.debug(f"Insert data: {insert_data}")
-                
+
                 try:
                     # Execute the bulk insert
                     cur.executemany(insert_query, insert_data)
@@ -1097,12 +1094,12 @@ def add_portfolio_holdings(
                     raise HTTPException(status_code=500, detail=f"Database error during bulk insert: {str(e)}")
 
             conn.commit()
-            logger.info(f"Successfully added {len(holdings_data.holdings)} holdings to portfolio {holdings_data.portfolio_id}")
+            logger.info(f"Successfully added {len(holdings_data.holdings)} holdings to new portfolio {new_portfolio_id}")
         except HTTPException as http_exc:
             logger.exception("HTTP exception occurred")
             raise http_exc
         except psycopg_errors.ForeignKeyViolation:
-            raise HTTPException(status_code=400, detail="Invalid portfolio ID or account ID")
+            raise HTTPException(status_code=400, detail="Invalid account ID")
         except psycopg_errors.CheckViolation as e:
             raise HTTPException(status_code=400, detail=f"Constraint violation: {str(e)}")
         except psycopg_errors.UniqueViolation:
@@ -1118,10 +1115,9 @@ def add_portfolio_holdings(
 
     return {
         "status": "success",
-        "message": f"Added {len(holdings_data.holdings)} holdings to the portfolio",
-        "portfolio_id": holdings_data.portfolio_id  # Added portfolio_id to the response
+        "message": f"Added {len(holdings_data.holdings)} holdings to the new portfolio",
+        "portfolio_id": new_portfolio_id  # Return the generated portfolio_id in the response
     }
-
 class PortfolioHolding(BaseModel):
     symbol: str
     quantity: float
@@ -1210,7 +1206,10 @@ def get_portfolio_holdings(
 def get_asset_allocation(
     ids: List[UUID] = Query(..., description="List of portfolio or account IDs."),
     types: List[str] = Query(..., description="List of types corresponding to each ID ('account' or 'portfolio')."),
-    as_of_date: datetime = Query(..., description="As of date in 'YYYY-MM-DD' format."),
+    as_of_date: Optional[datetime] = Query(
+        None,
+        description="As of date in 'YYYY-MM-DD' format. Defaults to today's date if not provided."
+    ),
     current_user: str = Depends(get_current_user)
 ) -> Dict[str, Dict[str, float]]:
     """
@@ -1219,12 +1218,16 @@ def get_asset_allocation(
     Args:
         ids (List[UUID]): A list of portfolio or account IDs.
         types (List[str]): Corresponding types for each ID ('account' or 'portfolio').
-        as_of_date (datetime): The date for which to retrieve the asset allocations.
+        as_of_date (Optional[datetime]): The date for which to retrieve the asset allocations. Defaults to today's date if not provided.
         current_user (str): The currently authenticated user.
 
     Returns:
         Dict[str, Dict[str, float]]: A dictionary where keys are IDs and values are asset allocation objects.
     """
+    # If as_of_date is not provided, default to today's date
+    if as_of_date is None:
+        as_of_date = datetime.today()
+
     logger.info(f"User {current_user} requested asset allocation for IDs {ids} with types {types} as of {as_of_date.date()}.")
 
     if len(ids) != len(types):
