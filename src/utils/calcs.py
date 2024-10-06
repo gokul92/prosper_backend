@@ -12,6 +12,11 @@ from src.domain_logic.optimization import PortfolioOptimizer
 from src.domain_logic.simulation import simulate_balance_paths
 from contextlib import contextmanager
 from src.domain_logic.optimization import TaxOptimizer
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -31,7 +36,7 @@ def get_connection():
     finally:
         conn.close()
 
-def fetch_account_data(account_id: str, as_of_date: str) -> Dict:
+def fetch_account_data(account_id: str, as_of_date: str) -> List[Dict]:
     query = """
     WITH latest_holdings AS (
         SELECT account_id, MAX(as_of_date) as max_date
@@ -44,7 +49,9 @@ def fetch_account_data(account_id: str, as_of_date: str) -> Dict:
            sm.security_type, sm.mstar_id,
            CASE
                WHEN sm.security_type = 'Equity' THEN eph.close_price
-               ELSE fmp.day_end_market_price
+               WHEN sm.security_type IN ('OEF', 'CEF', 'ETF', 'MMF') THEN fmp.day_end_market_price
+               WHEN sm.security_type = 'Cash' THEN 1.0  -- Cash price is $1
+               ELSE NULL
            END as price,
            hrs.annualized_return, hrs.annualized_volatility
     FROM account_holdings ah
@@ -55,7 +62,7 @@ def fetch_account_data(account_id: str, as_of_date: str) -> Dict:
         WHERE symbol = ah.symbol AND as_of_date <= %s
         ORDER BY as_of_date DESC
         LIMIT 1
-    ) sm ON true
+    ) sm ON sm.symbol = ah.symbol
     LEFT JOIN LATERAL (
         SELECT ticker, close_price
         FROM equities_price_history
@@ -76,20 +83,28 @@ def fetch_account_data(account_id: str, as_of_date: str) -> Dict:
         WHERE symbol = ah.symbol AND as_of_date <= %s
         ORDER BY as_of_date DESC
         LIMIT 1
-    ) hrs ON true
+    ) hrs ON sm.symbol = hrs.symbol
     WHERE ah.account_id = %s
     """
     
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(query, (account_id, as_of_date, as_of_date, as_of_date, as_of_date, as_of_date, as_of_date, as_of_date, account_id))
+            params = (
+                account_id, as_of_date,
+                as_of_date,  # For security_master lateral join
+                as_of_date, as_of_date,  # For equities_price_history lateral join
+                as_of_date, as_of_date,  # For funds_market_price_and_capitalization lateral join
+                as_of_date,  # For historical_return_statistics lateral join
+                account_id
+            )
+            cur.execute(query, params)
             holdings = cur.fetchall()
     
     return holdings
 
 def fetch_total_return_indices(symbols: List[str], symbol_types: Dict[str, str], as_of_date: str) -> Dict[str, pd.DataFrame]:
     equity_symbols = [symbol for symbol, type in symbol_types.items() if type == 'Equity']
-    fund_symbols = [symbol for symbol, type in symbol_types.items() if type in ["OEF", "CEF", "ETF", "MMF"]]
+    fund_symbols = [symbol for symbol, type in symbol_types.items() if type in ["OEF", "CEF", "ETF", "MMF", "Cash"]] # includes cash 
     
     total_return_indices = {}
     
@@ -119,7 +134,7 @@ def fetch_total_return_indices(symbols: List[str], symbol_types: Dict[str, str],
             if symbol not in total_return_indices:
                 total_return_indices[symbol] = []
             total_return_indices[symbol].append({'date': row['date'], 'value': row['value']})
-    
+        
     if fund_symbols:
         placeholders = ','.join(['%s'] * len(fund_symbols))
         
@@ -128,7 +143,7 @@ def fetch_total_return_indices(symbols: List[str], symbol_types: Dict[str, str],
         SELECT symbol, mstar_id
         FROM security_master
         WHERE symbol IN ({placeholders})
-          AND security_type IN ('OEF', 'CEF', 'ETF', 'MMF')
+          AND security_type IN ('OEF', 'CEF', 'ETF', 'MMF', 'Cash')
           AND as_of_date <= %s
         ORDER BY symbol, as_of_date DESC
         """
@@ -175,7 +190,7 @@ def fetch_total_return_indices(symbols: List[str], symbol_types: Dict[str, str],
         WHERE f.date <= %s
         ORDER BY sm.symbol, f.date
         """
-        
+
         with get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(fund_query, fund_symbols + [as_of_date] + mstar_ids + [as_of_date] + [as_of_date])
@@ -187,7 +202,7 @@ def fetch_total_return_indices(symbols: List[str], symbol_types: Dict[str, str],
             if symbol not in total_return_indices:
                 total_return_indices[symbol] = []
             total_return_indices[symbol].append({'date': row['date'], 'value': row['value']})
-    
+
     # Convert to DataFrame and filter for trading days
     nyse = mcal.get_calendar('NYSE')
     for symbol, data in total_return_indices.items():
@@ -203,47 +218,95 @@ def process_return_data(total_return_indices: Dict[str, pd.DataFrame]) -> Dict[s
     return_data = {}
     
     for symbol, df in total_return_indices.items():
+        # Debugging statements
+        print(f"Processing symbol: {symbol}")
+        print(f"Columns before reset_index: {df.columns.tolist()}")
+        print(f"Index name before reset_index: {df.index.name}")
+
+        # Reset index to make the index a column
+        df = df.reset_index()
+
+        # Identify the index column name
+        index_col = df.columns[0]  # The index column becomes the first column after reset_index()
+        
+        # Rename the index column to 'date' if it's not already 'date'
+        if index_col != 'date':
+            df.rename(columns={index_col: 'date'}, inplace=True)
+
+        # Verify that 'date' is now a column
+        if 'date' not in df.columns:
+            raise KeyError("The DataFrame does not contain a 'date' column after resetting index.")
+        
+        print(f"Columns after renaming: {df.columns.tolist()}")
+
+        # Now proceed with processing
         df = df.sort_values(by='date', ascending=True)
         df['return'] = df['value'].pct_change()
         df = df.dropna(subset=['return'])
         
-        # Remove leading rows with 0 return values
-        first_non_zero_index = df['return'].ne(0).idxmax()
-        df = df.loc[first_non_zero_index:]
+        # Remove leading rows with zero return values
+        if not df['return'].ne(0).any():
+            # All return values are zero, skip this symbol
+            print(f"All return values are zero for {symbol}, skipping.")
+            continue
+        else:
+            first_non_zero_index = df['return'].ne(0).idxmax()
+            df = df.loc[first_non_zero_index:]
+        
+        # Set 'date' as the index
+        df.set_index('date', inplace=True)
         
         return_data[symbol] = df
     
     return return_data
 
-def calculate_symbol_weights(holdings: List[Dict]) -> Tuple[Dict[str, Dict[str, float]], float]:
+def calculate_symbol_weights(holdings: List[Dict]) -> Tuple[Dict[str, Dict[str, Union[float, None]]], float]:
     total_value = sum(holding['quantity'] * holding['price'] for holding in holdings)
-    
+
     weights = {}
     for holding in holdings:
         symbol = holding['symbol']
         weight = (holding['quantity'] * holding['price']) / total_value if total_value > 0 else 0
-        weights[symbol] = {
-            'weight': weight,
-            'return': holding['annualized_return'],
-            'volatility': holding['annualized_volatility']
+        weight_data = {
+            'weight': weight
         }
-    
+
+        # Include 'return' if available
+        weight_data['return'] = holding.get('annualized_return')
+
+        # Include 'volatility' if available
+        weight_data['volatility'] = holding.get('annualized_volatility')
+
+        weights[symbol] = weight_data
+
     return weights, total_value
 
-def calculate_portfolio_return(weights: Dict[str, Dict[str, float]]) -> float:
-    return sum(data['weight'] * data['return'] for data in weights.values())
+def calculate_portfolio_return(weights: Dict[str, Dict[str, Union[float, None]]]) -> float:
+    return sum(data['weight'] * data['return'] for data in weights.values() if data['return'] is not None)
 
 def calculate_covariances(return_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     if return_data:
+        # Ensure all indices are of datetime type
+        for symbol, data in return_data.items():
+            if not np.issubdtype(data.index.dtype, np.datetime64):
+                data.index = pd.to_datetime(data.index)
+                return_data[symbol] = data
+
+        # Compute the intersection of dates
         common_dates = list(set.intersection(*[set(data.index) for data in return_data.values()]))
         common_dates.sort()  # Ensure dates are in order
     else:
         common_dates = []  # or handle the empty case as appropriate for your use case
     
     # Filter returns to only include common dates
-    filtered_returns = {symbol: data.loc[common_dates]['return'] for symbol, data in return_data.items()}
+    filtered_returns = {}
+    for symbol, data in return_data.items():
+        # Ensure data.index is datetime and aligned with common_dates
+        data = data.loc[data.index.isin(common_dates)]
+        filtered_returns[symbol] = data['return']
     
-    returns = pd.DataFrame(filtered_returns)
+    returns = pd.DataFrame(filtered_returns, index=common_dates)
+    returns.sort_index(inplace=True)
     
     # Calculate the covariance matrix
     cov_matrix = returns.cov()
@@ -254,7 +317,7 @@ def calculate_covariances(return_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     
     return cov_matrix_annual
 
-def calculate_portfolio_volatility(weights: Dict[str, Dict[str, float]], covariance_matrix: pd.DataFrame) -> float:
+def calculate_portfolio_volatility(weights: Dict[str, Dict[str, Union[float, None]]], covariance_matrix: pd.DataFrame) -> float:
     if len(weights) == 1:
         # If there's only one holding, return its volatility directly
         return list(weights.values())[0]['volatility']
@@ -294,7 +357,7 @@ def portfolio_statistics(account_id: str, as_of_date: str, return_portfolio_deta
     if account_id == '':
         if not data or not isinstance(data, dict):
             raise ValueError("When account_id is empty, data must be provided as a non-empty dictionary.")
-        
+                
         required_keys = ['account_balance', 'holdings', 'weights', 'return_data']
         if not all(key in data for key in required_keys):
             raise ValueError(f"Data dictionary must contain all of these keys: {required_keys}")
@@ -302,14 +365,35 @@ def portfolio_statistics(account_id: str, as_of_date: str, return_portfolio_deta
         account_balance = data['account_balance']
         holdings = data['holdings']
         weights = data['weights']
-        return_data = data['return_data']
+        return_data_dict = data['return_data']
         
         # Aggregate holdings if not already aggregated
         if any(h1['symbol'] == h2['symbol'] for h1 in holdings for h2 in holdings if h1 != h2):
             holdings = aggregate_holdings(holdings)
         
-        # Convert nested dictionary return_data back to DataFrame
-        return_data = {symbol: pd.DataFrame.from_dict(data, orient='index') for symbol, data in return_data.items()}
+        # Correctly reconstruct return_data DataFrames and ensure 'return' column is present
+        return_data = {}
+        for symbol, data_dict in return_data_dict.items():            
+            # Check if data_dict is already a DataFrame
+            if isinstance(data_dict, pd.DataFrame):
+                df = data_dict.copy()
+            else:
+                df = pd.DataFrame.from_dict(data_dict, orient='index')
+
+            df.index = pd.to_datetime(df.index)  # Convert index to datetime
+            df.sort_index(inplace=True)  # Ensure data is sorted by date
+            df.reset_index(inplace=True)  # Reset index to get 'date' as a column
+            df.rename(columns={'index': 'date'}, inplace=True)  # Rename 'index' column to 'date'
+
+            # Verify if 'return' column is present
+            if 'return' not in df.columns:
+                # Recalculate 'return' column
+                df = df.sort_values(by='date', ascending=True)
+                df['return'] = df['value'].pct_change()
+                df.dropna(subset=['return'], inplace=True)
+                df.reset_index(drop=True, inplace=True)
+
+            return_data[symbol] = df.set_index('date')  # Set 'date' as index for further calculations
     else:
         # Fetch all account data in one query
         raw_holdings = fetch_account_data(account_id, as_of_date)
@@ -352,51 +436,41 @@ def portfolio_statistics(account_id: str, as_of_date: str, return_portfolio_deta
         'weights': {symbol: data['weight'] for symbol, data in weights.items()},
         'individual_stats': individual_stats,
         'account_balance': account_balance,
-        'holdings': holdings
+        'holdings': holdings,
+        'return_data': return_data  # Keep DataFrames here
     }
 
     if return_portfolio_detail:
-        # Convert DataFrame back to nested dictionary for JSON serialization
-        result['return_data'] = {symbol: df.to_dict(orient='index') for symbol, df in return_data.items()}
+        # Serialize 'return_data' separately
+        result['return_data_serialized'] = {symbol: df.to_dict(orient='index') for symbol, df in return_data.items()}
 
     return result
 
-import logging
-
-# Set up logging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-
-def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Union[float, Dict]]:    
-    # Fetch portfolio statistics with return data
+def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Union[float, Dict]]:
+    # Fetch portfolio statistics with return data (DataFrames)
     stats = portfolio_statistics(account_id, as_of_date, return_portfolio_detail=True)
     
-    return_data = stats['return_data']
+    return_data = stats['return_data']  # This is now a dict of DataFrames
     weights = stats['weights']
     account_balance = stats['account_balance']
     original_holdings = stats['holdings']
     
     # Check if '$$$$' is not in weights
     if '$$$$' not in weights:
-        # Fetch cash returns using VUSXX
-        cash_return_indices = fetch_total_return_indices(['VUSXX'], {'VUSXX': 'MMF'}, as_of_date)
+
+        # Fetch cash returns using $$$$
+        cash_return_indices = fetch_total_return_indices(['$$$$'], {'$$$$': 'Cash'}, as_of_date)
+
         cash_return_data = process_return_data(cash_return_indices)
         
         # Add '$$$$' to weights with zero weight
         weights['$$$$'] = 0
         
         # Add cash return data to return_data
-        return_data['$$$$'] = cash_return_data['VUSXX'].to_dict(orient='index')
+        return_data['$$$$'] = cash_return_data['$$$$']
     
-    # Convert date keys to strings in return_data
-    for symbol, data in return_data.items():
-        return_data[symbol] = {
-            date.strftime('%Y-%m-%d') if isinstance(date, datetime.date) else str(date): values
-            for date, values in data.items()
-        }
-    
-    # Find common date range
-    common_dates = list(set.intersection(*[set(data.keys()) for data in return_data.values()]))
+    # Find common date range before converting return_data to dict
+    common_dates = list(set.intersection(*[set(data.index) for data in return_data.values()]))
     common_dates.sort()
 
     # Prepare symbols list ensuring '$$$$' is last
@@ -408,7 +482,8 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
     R = []
     for symbol in symbols:
         try:
-            R.append([return_data[symbol][date]['return'] for date in common_dates])
+            # Access 'return' column using .loc with the date index
+            R.append(return_data[symbol].loc[common_dates, 'return'].values)
         except KeyError as e:
             logger.error(f"KeyError when preparing R matrix for symbol {symbol}: {str(e)}")
             logger.error(f"Return data for {symbol}: {return_data.get(symbol, 'Not found')}")
@@ -422,7 +497,7 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
     cash_index = len(symbols) - 1  # Cash is always the last index
     
     optimized_portfolios = {}
-    
+
     # Simulate balance paths for the original portfolio
     original_simulation_result = simulate_balance_paths(
         starting_balance=account_balance,
@@ -456,8 +531,7 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
         
         optimizer = PortfolioOptimizer(R, k, alpha, l, c, cash_index)
         optimal_weights, optimization_result = optimizer.optimize()
-        
-        # Map optimal weights back to tickers
+                # Map optimal weights back to tickers
         optimal_portfolio = {
             symbol: {
                 'weight': weight,
@@ -466,7 +540,7 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
             }
             for symbol, weight in zip(symbols, optimal_weights)
         }
-        
+
         # Prepare holdings for the optimized portfolio
         optimized_holdings = []
         for symbol, data in optimal_portfolio.items():
@@ -529,6 +603,15 @@ def optimized_portfolio_stats(account_id: str, as_of_date: str) -> Dict[str, Uni
             'expected_return_path': simulation_result['expected_return_path'].to_dict(),
             'prob_between_starting_and_expected': simulation_result['prob_between_starting_and_expected'],
             'final_expected_return_balance': simulation_result['final_expected_return_balance']
+        }
+    
+    # After all DataFrame operations, convert date keys to strings in return_data
+    for symbol, df in return_data.items():
+        return_data[symbol] = df.to_dict(orient='index')
+        # Convert date keys to strings
+        return_data[symbol] = {
+            date.strftime('%Y-%m-%d') if isinstance(date, datetime.date) else str(date): values
+            for date, values in return_data[symbol].items()
         }
     
     if 'return_data' in stats:
@@ -848,7 +931,9 @@ def fetch_portfolio_data(as_of_date: str, portfolio_id: str = None, account_id: 
                        sm.security_type, sm.mstar_id,
                        CASE
                            WHEN sm.security_type = 'Equity' THEN eph.close_price
-                           ELSE fmp.day_end_market_price
+                           WHEN sm.security_type IN ('OEF', 'CEF', 'ETF', 'MMF') THEN fmp.day_end_market_price
+                           WHEN sm.security_type = 'Cash' THEN 1.0  -- Cash price is $1
+                           ELSE NULL
                        END as price
                 FROM portfolio_holdings ph
                 JOIN latest_holdings lh ON ph.{id_field} = lh.{id_field} AND ph.as_of_date = lh.max_date
@@ -858,25 +943,31 @@ def fetch_portfolio_data(as_of_date: str, portfolio_id: str = None, account_id: 
                     WHERE symbol = ph.symbol AND as_of_date <= %s
                     ORDER BY as_of_date DESC
                     LIMIT 1
-                ) sm ON true
+                ) sm ON sm.symbol = ph.symbol
                 LEFT JOIN LATERAL (
                     SELECT ticker, close_price
                     FROM equities_price_history
-                    WHERE ticker = ph.symbol AND date <= %s
-                    ORDER BY date DESC
+                    WHERE ticker = ph.symbol AND date <= %s AND as_of_date <= %s
+                    ORDER BY date DESC, as_of_date DESC
                     LIMIT 1
                 ) eph ON sm.security_type = 'Equity'
                 LEFT JOIN LATERAL (
                     SELECT ticker, day_end_market_price
                     FROM funds_market_price_and_capitalization
-                    WHERE ticker = ph.symbol AND date <= %s
-                    ORDER BY date DESC
+                    WHERE ticker = ph.symbol AND date <= %s AND as_of_date <= %s
+                    ORDER BY date DESC, as_of_date DESC
                     LIMIT 1
                 ) fmp ON sm.security_type IN ('OEF', 'CEF', 'ETF', 'MMF')
                 WHERE ph.{id_field} = %s
                 """
 
-                params = (id_value, as_of_date, as_of_date, as_of_date, as_of_date, id_value)
+                params = (
+                    id_value, as_of_date,
+                    as_of_date,  # For security_master lateral join
+                    as_of_date, as_of_date,  # For equities_price_history lateral join
+                    as_of_date, as_of_date,  # For funds_market_price_and_capitalization lateral join
+                    id_value
+                )
 
                 cur.execute(query, params)
                 holdings = cur.fetchall()
@@ -927,6 +1018,7 @@ def fetch_fund_asset_allocation(symbol: str, as_of_date: str) -> Dict[str, Any]:
             else:
                 return None
 
+# TODO: Add support for $$$$ cash treatment
 def calculate_asset_allocation(
     as_of_date: str,
     argument_type: str,
@@ -952,7 +1044,9 @@ def calculate_asset_allocation(
 
     # Fetch holdings based on argument_type
     if argument_type == 'account':
-        holdings = fetch_account_data(account_id=argument_id, as_of_date=as_of_date)
+        raw_holdings = fetch_account_data(account_id=argument_id, as_of_date=as_of_date)
+        # Aggregate holdings for accounts
+        holdings = aggregate_holdings(raw_holdings)
     elif argument_type == 'portfolio':
         holdings = fetch_portfolio_data(as_of_date=as_of_date, portfolio_id=argument_id)
     else:
@@ -969,7 +1063,9 @@ def calculate_asset_allocation(
                 raise ValueError(f"Missing required field '{field}' in holdings data for symbol '{holding.get('symbol', 'unknown')}'.")
 
     # Calculate weights of each security
-    weights, total_value = calculate_symbol_weights(holdings)
+    weights, _ = calculate_symbol_weights(holdings)
+
+    print(f"Weights within asset allocation: {weights}")
 
     # Initialize asset allocation components
     asset_allocation = {
@@ -996,7 +1092,7 @@ def calculate_asset_allocation(
                 'preferred': 0.0,
                 'stock': 100.0
             }
-        elif security_type in ('ETF', 'MMF', 'OEF', 'CEF'):
+        elif security_type in ('ETF', 'MMF', 'OEF', 'CEF', 'Cash'):
             # Fetch asset allocation from funds_asset_allocation table
             fund_allocation = fetch_fund_asset_allocation(
                 symbol=symbol,
