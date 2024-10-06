@@ -652,8 +652,6 @@ def monte_carlo_simulation(
             # If not cached, perform the simulation
             simulation_result = optimized_portfolio_stats(account_id, as_of_date)
 
-            print("simulation result completed")
-
             # Prepare response
             result = {
                 "account_id": account_id,
@@ -662,11 +660,7 @@ def monte_carlo_simulation(
                 "optimized_portfolios": simulation_result['optimized_portfolios']
             }
 
-            print("result prepared")
-
             processed_result = process_for_json(result)
-
-            print("result processed")
 
             # Write response to JSON file
             # from pathlib import Path
@@ -689,18 +683,12 @@ def monte_carlo_simulation(
                 )
             conn.commit()
 
-            print("result cached")
-
             # Update in-memory cache
             get_cached_simulation.cache_clear()
             get_cached_simulation(cache_key)
 
-            print("result cached in memory")
-
             # Use jsonable_encoder to prepare the response
             json_compatible_result = jsonable_encoder(processed_result)
-
-            print("result json compatible")
             return JSONResponse(content=json_compatible_result)
 
     except HTTPException:
@@ -799,7 +787,6 @@ def optimize_taxes(
     portfolio_id: UUID4,
     current_user: str = Depends(get_current_user)
 ):
-    logger.info(f"Received optimize taxes request for account: {account_id} and portfolio: {portfolio_id}")
 
     as_of_date = date.today()
 
